@@ -1,17 +1,19 @@
 "use client";
 
+import Image from "next/image";
 import { useEffect, useMemo, useState } from "react";
 import {
   FaBolt,
+  FaChevronDown,
   FaCheckCircle,
   FaCopy,
   FaEdit,
   FaFileExport,
-  FaSave,
   FaKey,
   FaLink,
   FaMagic,
   FaPaste,
+  FaSave,
   FaShieldAlt,
   FaSpinner,
   FaTag,
@@ -48,6 +50,15 @@ type TestResult = {
 const STORAGE_KEY = "ai-key-vault-configs-v1";
 const PASS_TEXT = "主人，快鞭策我吧";
 const FAIL_TEXT = "主人，我不行了";
+
+const labelClass = "mb-1.5 mt-2.5 block text-sm font-semibold text-zinc-700";
+const inputClass =
+  "w-full rounded-xl border border-zinc-300 bg-white px-3 py-2.5 text-sm text-zinc-900 outline-none transition focus:border-zinc-400 focus:ring-4 focus:ring-emerald-100";
+const btnBase =
+  "inline-flex items-center gap-2 rounded-full border px-3.5 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60";
+const btnPrimary = `${btnBase} border-emerald-700 bg-emerald-600 text-white hover:bg-emerald-700`;
+const btnGhost = `${btnBase} border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-50 hover:border-zinc-400`;
+const btnDanger = `${btnBase} border-red-200 bg-white text-red-600 hover:border-red-700 hover:bg-red-700 hover:text-white`;
 
 function normalizeBaseUrl(raw: string): string {
   const cleaned = raw.trim().replace(/\/+$/, "");
@@ -157,17 +168,17 @@ function defaultTestResult(): TestResult {
   return { status: "idle", message: "未测试" };
 }
 
-function statusClass(status: TestStatus): string {
-  if (status === "success") return "status-pill success";
-  if (status === "error") return "status-pill error";
-  if (status === "pending") return "status-pill pending";
-  return "status-pill idle";
+function statusPillClass(status: TestStatus): string {
+  if (status === "success") return "bg-emerald-50 text-emerald-800";
+  if (status === "error") return "bg-red-50 text-red-700";
+  if (status === "pending") return "bg-amber-50 text-amber-700";
+  return "bg-zinc-100 text-zinc-600";
 }
 
 function StatusIcon({ status }: { status: TestStatus }) {
   if (status === "success") return <FaCheckCircle aria-hidden />;
   if (status === "error") return <FaTimesCircle aria-hidden />;
-  if (status === "pending") return <FaSpinner className="spin" aria-hidden />;
+  if (status === "pending") return <FaSpinner className="animate-spin" aria-hidden />;
   return <FaVial aria-hidden />;
 }
 
@@ -179,7 +190,6 @@ export default function Home() {
   const [resultMap, setResultMap] = useState<Record<string, TestResult>>({});
   const [notice, setNotice] = useState("");
   const [testingAll, setTestingAll] = useState(false);
-  const [exportType, setExportType] = useState<ExportType>("md");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "" });
   const [quickModelMap, setQuickModelMap] = useState<Record<string, string>>({});
@@ -225,9 +235,7 @@ export default function Home() {
       apiKey: parsed.apiKey?.trim() || form.apiKey,
       model: parsed.model?.trim() || form.model
     };
-    if (!merged.name && merged.baseUrl) {
-      merged.name = makeDefaultName(merged.baseUrl, nextIndex);
-    }
+    if (!merged.name && merged.baseUrl) merged.name = makeDefaultName(merged.baseUrl, nextIndex);
     setForm(merged);
     setNotice("已解析到表单");
   }
@@ -268,7 +276,6 @@ export default function Home() {
     let name = form.name.trim();
     if (!baseUrl || !apiKey) return;
     if (!name) name = makeDefaultName(baseUrl, nextIndex);
-
     addItem(name, baseUrl, apiKey, model);
     setNotice("保存成功");
   }
@@ -285,10 +292,7 @@ export default function Home() {
 
   async function runTest(item: KeyConfig): Promise<boolean> {
     setLoadingMap((prev) => ({ ...prev, [item.id]: true }));
-    setResultMap((prev) => ({
-      ...prev,
-      [item.id]: { status: "pending", message: "测试中..." }
-    }));
+    setResultMap((prev) => ({ ...prev, [item.id]: { status: "pending", message: "测试中..." } }));
 
     try {
       const resp = await fetch("/api/test-key", {
@@ -332,6 +336,7 @@ export default function Home() {
       setNotice("暂无配置可测试");
       return;
     }
+
     setTestingAll(true);
     setNotice("开始测试全部配置...");
     const result = await Promise.all(configs.map((item) => runTest(item)));
@@ -369,26 +374,21 @@ export default function Home() {
     setNotice("导出完成");
   }
 
-  function exportOne(item: KeyConfig) {
-    const filename = `${sanitizeFilename(item.name || "ai-key")}.${exportType}`;
-    const content = formatConfig(item, exportType);
+  function exportOne(item: KeyConfig, type: ExportType) {
+    const filename = `${sanitizeFilename(item.name || "ai-key")}.${type}`;
+    const content = formatConfig(item, type);
     downloadText(filename, content);
   }
 
-  function exportAll() {
-    const content = formatAll(configs, exportType);
-    const filename = `ai-key-configs.${exportType}`;
+  function exportAll(type: ExportType) {
+    const content = formatAll(configs, type);
+    const filename = `ai-key-configs.${type}`;
     downloadText(filename, content);
   }
 
   function startEdit(item: KeyConfig) {
     setEditingId(item.id);
-    setEditForm({
-      name: item.name,
-      baseUrl: item.baseUrl,
-      apiKey: item.apiKey,
-      model: item.model
-    });
+    setEditForm({ name: item.name, baseUrl: item.baseUrl, apiKey: item.apiKey, model: item.model });
   }
 
   function cancelEdit() {
@@ -409,15 +409,7 @@ export default function Home() {
 
     setConfigs((prev) =>
       prev.map((item) =>
-        item.id === id
-          ? {
-              ...item,
-              name: name || item.name,
-              baseUrl,
-              apiKey,
-              model
-            }
-          : item
+        item.id === id ? { ...item, name: name || item.name, baseUrl, apiKey, model } : item
       )
     );
 
@@ -431,79 +423,130 @@ export default function Home() {
     setNotice("模型名已更新");
   }
 
+  function ExportMenu({
+    onExport,
+    label = "导出"
+  }: {
+    onExport: (type: ExportType) => void;
+    label?: string;
+  }) {
+    const itemClass =
+      "flex w-full items-center rounded-lg px-2.5 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-100";
+
+    function handle(type: ExportType, e: React.MouseEvent<HTMLButtonElement>) {
+      onExport(type);
+      const details = e.currentTarget.closest("details") as HTMLDetailsElement | null;
+      if (details) details.open = false;
+    }
+
+    return (
+      <details className="relative">
+        <summary className={`${btnGhost} list-none cursor-pointer [&::-webkit-details-marker]:hidden`}>
+          <FaFileExport aria-hidden />
+          <span>{label}</span>
+          <FaChevronDown className="text-xs opacity-70" aria-hidden />
+        </summary>
+        <div className="absolute right-0 z-20 mt-1 w-40 rounded-xl border border-zinc-200 bg-white p-1 shadow-lg">
+          <button type="button" className={itemClass} onClick={(e) => handle("md", e)}>
+            导出 .md
+          </button>
+          <button type="button" className={itemClass} onClick={(e) => handle("txt", e)}>
+            导出 .txt
+          </button>
+        </div>
+      </details>
+    );
+  }
+
   return (
-    <main className="page">
-      <header className="hero">
-        <h1>
-          <FaShieldAlt aria-hidden />
+    <main className="mx-auto w-full max-w-5xl space-y-3 px-3 py-4 text-zinc-900 sm:px-4">
+      <header className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-zinc-900 sm:text-3xl">
+          <Image
+            src="/logo.png"
+            alt="Logo"
+            width={32}
+            height={32}
+            className="h-8 w-8 rounded-lg object-cover ring-1 ring-emerald-200 sm:h-9 sm:w-9"
+            priority
+          />
+          <FaShieldAlt className="text-emerald-600" aria-hidden />
           <span>AI Key Vault</span>
         </h1>
-        <p>本地保存、批量测试、复制与导出</p>
+        <p className="text-sm text-zinc-500">本地保存、批量测试、复制与导出</p>
       </header>
 
-      <section className="purpose-banner" aria-label="页面说明">
-        <p className="purpose-title">这是你的 AI API Key 本地保险箱</p>
-        <p className="purpose-subtitle">统一管理名称/地址/Key/模型，支持一键测全部和单条测试，数据仅存浏览器本地。</p>
+      <section className="rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 via-emerald-50/70 to-white p-3.5 shadow-sm">
+        <p className="text-base font-extrabold text-emerald-900 sm:text-lg">这是你的 AI API Key 本地保险箱</p>
+        <p className="mt-1.5 text-sm leading-6 text-emerald-800">
+          统一管理名称/地址/Key/模型，支持一键测全部和单条测试，数据仅存浏览器本地。
+        </p>
       </section>
 
-      <section className="panel panel-form">
-        <div className="panel-head">
-          <h2>新增配置</h2>
-          <span>{configs.length} 条配置</span>
+      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
+      <section className="rounded-2xl border border-zinc-200 bg-white p-3.5 shadow-sm sm:p-4">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <h2 className="text-base font-semibold text-zinc-900">新增配置</h2>
+          <span className="text-xs text-zinc-500">{configs.length} 条配置</span>
         </div>
 
-        <label className="label">粘贴内容（自动识别地址、Key、模型）</label>
+        <label className={labelClass}>粘贴内容（自动识别地址、Key、模型）</label>
         <textarea
+          className={inputClass}
           value={pasteRaw}
           onChange={(e) => setPasteRaw(e.target.value)}
           placeholder="可粘贴 curl、JSON、环境变量等内容"
-          rows={5}
+          rows={3}
         />
 
-        <div className="toolbar">
-          <button type="button" className="ghost" onClick={applyPaste}>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button type="button" className={btnGhost} onClick={applyPaste}>
             <FaMagic aria-hidden />
             <span>解析到表单</span>
           </button>
-          <button type="button" className="primary" onClick={addFromPaste}>
+          <button type="button" className={btnPrimary} onClick={addFromPaste}>
             <FaPaste aria-hidden />
             <span>粘贴并直接新增</span>
           </button>
         </div>
 
-        <form onSubmit={addConfig} className="form">
-          <label className="label">名称</label>
+        <form onSubmit={addConfig} className="mt-2">
+          <label className={labelClass}>名称</label>
           <input
+            className={inputClass}
             value={form.name}
             onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
             placeholder="例如：OpenAI-主账号"
           />
 
-          <label className="label">地址</label>
+          <label className={labelClass}>地址</label>
           <input
+            className={inputClass}
             value={form.baseUrl}
             onChange={(e) => setForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
             placeholder="例如：https://api.openai.com/v1"
             required
           />
 
-          <label className="label">Key</label>
+          <label className={labelClass}>Key</label>
           <input
+            className={inputClass}
             value={form.apiKey}
             onChange={(e) => setForm((prev) => ({ ...prev, apiKey: e.target.value }))}
             placeholder="例如：sk-xxxx"
             required
           />
 
-          <label className="label">模型（可选）</label>
+          <label className={labelClass}>模型（可选）</label>
           <input
+            className={inputClass}
             value={form.model}
             onChange={(e) => setForm((prev) => ({ ...prev, model: e.target.value }))}
             placeholder="例如：gpt-4.1-mini"
           />
 
-          <div className="toolbar">
-            <button type="submit" className="primary">
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button type="submit" className={btnPrimary}>
               <FaSave aria-hidden />
               <span>保存配置</span>
             </button>
@@ -511,84 +554,83 @@ export default function Home() {
         </form>
       </section>
 
-      <section className="panel">
-        <div className="panel-head list-head">
-          <h2>配置列表</h2>
-          <div className="toolbar compact">
-            <button type="button" className="primary" onClick={testAllConfigs} disabled={testingAll}>
-              {testingAll ? <FaSpinner className="spin" aria-hidden /> : <FaBolt aria-hidden />}
+      <section className="rounded-2xl border border-zinc-200 bg-white p-3.5 shadow-sm sm:p-4">
+        <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <h2 className="text-base font-semibold text-zinc-900">配置列表</h2>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className={btnPrimary} onClick={testAllConfigs} disabled={testingAll}>
+              {testingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
               <span>{testingAll ? "测试中" : "一键测试全部"}</span>
             </button>
             <button
               type="button"
-              className="ghost"
+              className={btnGhost}
               onClick={() => copyText(formatAll(configs, "txt"), "已复制全部配置")}
             >
               <FaCopy aria-hidden />
               <span>复制全部</span>
             </button>
-            <select
-              className="select"
-              value={exportType}
-              onChange={(e) => setExportType(e.target.value as ExportType)}
-              aria-label="导出格式"
-            >
-              <option value="md">导出格式：Markdown (.md)</option>
-              <option value="txt">导出格式：Text (.txt)</option>
-            </select>
-            <button type="button" className="ghost" onClick={exportAll}>
-              <FaFileExport aria-hidden />
-              <span>导出</span>
-            </button>
+            <ExportMenu onExport={exportAll} />
           </div>
         </div>
 
-        {notice ? <div className="notice">{notice}</div> : null}
+        {notice ? (
+          <div className="mb-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+            {notice}
+          </div>
+        ) : null}
 
         {configs.length === 0 ? (
-          <p className="empty">暂无配置</p>
+          <p className="text-sm text-zinc-500">暂无配置</p>
         ) : (
-          <ul className="list">
+          <ul className="grid gap-3">
             {configs.map((item) => {
               const testing = loadingMap[item.id];
               const result = resultMap[item.id] || defaultTestResult();
               const isEditing = editingId === item.id;
 
               return (
-                <li key={item.id} className="item">
-                  <div className="item-main">
+                <li
+                  key={item.id}
+                  className="grid gap-3 rounded-2xl border border-zinc-200 bg-white p-3 lg:grid-cols-[1fr_auto] lg:items-center"
+                >
+                  <div className="grid gap-2">
                     {isEditing ? (
-                      <div className="edit-box">
-                        <label className="label">名称</label>
+                      <div className="rounded-xl border border-dashed border-zinc-300 p-3">
+                        <label className={labelClass}>名称</label>
                         <input
+                          className={inputClass}
                           value={editForm.name}
                           onChange={(e) => setEditForm((prev) => ({ ...prev, name: e.target.value }))}
                         />
 
-                        <label className="label">地址</label>
+                        <label className={labelClass}>地址</label>
                         <input
+                          className={inputClass}
                           value={editForm.baseUrl}
                           onChange={(e) => setEditForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
                         />
 
-                        <label className="label">Key</label>
+                        <label className={labelClass}>Key</label>
                         <input
+                          className={inputClass}
                           value={editForm.apiKey}
                           onChange={(e) => setEditForm((prev) => ({ ...prev, apiKey: e.target.value }))}
                         />
 
-                        <label className="label">模型</label>
+                        <label className={labelClass}>模型</label>
                         <input
+                          className={inputClass}
                           value={editForm.model}
                           onChange={(e) => setEditForm((prev) => ({ ...prev, model: e.target.value }))}
                         />
 
-                        <div className="toolbar">
-                          <button type="button" className="primary" onClick={() => saveEdit(item.id)}>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <button type="button" className={btnPrimary} onClick={() => saveEdit(item.id)}>
                             <FaSave aria-hidden />
                             <span>保存编辑</span>
                           </button>
-                          <button type="button" className="ghost" onClick={cancelEdit}>
+                          <button type="button" className={btnGhost} onClick={cancelEdit}>
                             <FaTimesCircle aria-hidden />
                             <span>取消</span>
                           </button>
@@ -596,55 +638,54 @@ export default function Home() {
                       </div>
                     ) : (
                       <>
-                        <div className="item-title">{item.name}</div>
+                        <div className="text-base font-bold text-zinc-900">{item.name}</div>
 
-                        <div className="item-row">
-                          <span className="k">
+                        <div className="grid gap-1 sm:grid-cols-[100px_1fr] sm:items-start sm:gap-2">
+                          <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
                             <FaLink aria-hidden /> 地址
                           </span>
-                          <span className="v">{item.baseUrl}</span>
+                          <span className="break-all text-sm text-zinc-800">{item.baseUrl}</span>
                         </div>
 
-                        <div className="item-row">
-                          <span className="k">
+                        <div className="grid gap-1 sm:grid-cols-[100px_1fr] sm:items-start sm:gap-2">
+                          <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
                             <FaKey aria-hidden /> Key
                           </span>
-                          <span className="v mono">{toMaskedKey(item.apiKey)}</span>
+                          <span className="break-all font-mono text-sm text-zinc-800">{toMaskedKey(item.apiKey)}</span>
                         </div>
 
-                        <div className="item-row">
-                          <span className="k">
+                        <div className="grid gap-1 sm:grid-cols-[100px_1fr] sm:items-start sm:gap-2">
+                          <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
                             <FaTag aria-hidden /> 模型
                           </span>
-                          <div className="quick-model">
+                          <div className="flex flex-wrap gap-2">
                             <input
+                              className="min-w-0 flex-1 rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-zinc-400 focus:ring-4 focus:ring-emerald-100"
                               value={quickModelMap[item.id] || ""}
                               onChange={(e) =>
                                 setQuickModelMap((prev) => ({ ...prev, [item.id]: e.target.value }))
                               }
                               placeholder="快速修改模型名"
                             />
-                            <button
-                              type="button"
-                              className="ghost mini"
-                              onClick={() => quickSaveModel(item.id)}
-                            >
+                            <button type="button" className={btnGhost} onClick={() => quickSaveModel(item.id)}>
                               <FaSave aria-hidden />
                               <span>快速保存模型</span>
                             </button>
                           </div>
                         </div>
 
-                        <div className="item-row">
-                          <span className="k">
+                        <div className="grid gap-1 sm:grid-cols-[100px_1fr] sm:items-start sm:gap-2">
+                          <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
                             <FaVial aria-hidden /> 状态
                           </span>
-                          <div className="result-block">
-                            <span className={statusClass(result.status)}>
+                          <div className="grid gap-1">
+                            <span
+                              className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${statusPillClass(result.status)}`}
+                            >
                               <StatusIcon status={result.status} />
                               <span>{result.message}</span>
                             </span>
-                            {result.detail ? <span className="result-detail">{result.detail}</span> : null}
+                            {result.detail ? <span className="text-xs text-zinc-500">{result.detail}</span> : null}
                           </div>
                         </div>
                       </>
@@ -652,28 +693,25 @@ export default function Home() {
                   </div>
 
                   {!isEditing ? (
-                    <div className="item-actions">
-                      <button type="button" className="ghost" onClick={() => testConfig(item)} disabled={testing}>
-                        {testing ? <FaSpinner className="spin" aria-hidden /> : <FaBolt aria-hidden />}
+                    <div className="flex flex-wrap gap-2 lg:justify-end">
+                      <button type="button" className={btnGhost} onClick={() => testConfig(item)} disabled={testing}>
+                        {testing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
                         <span>{testing ? "测试中" : "测试"}</span>
                       </button>
                       <button
                         type="button"
-                        className="ghost"
+                        className={btnGhost}
                         onClick={() => copyText(formatConfig(item, "txt"), `已复制：${item.name}`)}
                       >
                         <FaCopy aria-hidden />
                         <span>复制</span>
                       </button>
-                      <button type="button" className="ghost" onClick={() => exportOne(item)}>
-                        <FaFileExport aria-hidden />
-                        <span>导出</span>
-                      </button>
-                      <button type="button" className="ghost" onClick={() => startEdit(item)}>
+                      <ExportMenu onExport={(type) => exportOne(item, type)} />
+                      <button type="button" className={btnGhost} onClick={() => startEdit(item)}>
                         <FaEdit aria-hidden />
                         <span>编辑</span>
                       </button>
-                      <button type="button" className="danger" onClick={() => removeConfig(item.id)}>
+                      <button type="button" className={btnDanger} onClick={() => removeConfig(item.id)}>
                         <FaTrashAlt aria-hidden />
                         <span>删除</span>
                       </button>
@@ -685,6 +723,7 @@ export default function Home() {
           </ul>
         )}
       </section>
+      </div>
     </main>
   );
 }
