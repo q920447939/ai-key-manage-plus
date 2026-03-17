@@ -6,6 +6,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FaBolt,
   FaCheckCircle,
+  FaChevronDown,
+  FaChevronUp,
   FaCopy,
   FaEdit,
   FaExchangeAlt,
@@ -84,6 +86,7 @@ type CcSwitchAction = {
 };
 
 const STORAGE_KEY = "ai-key-vault-configs-v1";
+const INTRO_SEEN_KEY = "ai-key-vault-intro-seen-v1";
 const PASS_TEXT = "主人，快鞭策我吧";
 const FAIL_TEXT = "主人，我不行了";
 const MODEL_CANDIDATES = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5-mini", "gpt-5"];
@@ -795,6 +798,7 @@ export default function Home() {
   const [ccSwitchDialogId, setCcSwitchDialogId] = useState<string | null>(null);
   const [ccSwitchTargetApp, setCcSwitchTargetApp] = useState<CcSwitchApp>("codex");
   const [probeDialogId, setProbeDialogId] = useState<string | null>(null);
+  const [introExpanded, setIntroExpanded] = useState(false);
 
   useEffect(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -809,6 +813,14 @@ export default function Home() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(configs));
   }, [configs]);
+
+  useEffect(() => {
+    const seen = localStorage.getItem(INTRO_SEEN_KEY) === "1";
+    setIntroExpanded(!seen);
+    if (!seen) {
+      localStorage.setItem(INTRO_SEEN_KEY, "1");
+    }
+  }, []);
 
   useEffect(() => {
     if (!notice) return;
@@ -1531,11 +1543,32 @@ export default function Home() {
       </header>
 
       <section className="rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 via-emerald-50/70 to-white p-3.5 shadow-sm">
-        <p className="text-base font-extrabold text-emerald-900 sm:text-lg">这是你的 AI API Key 本地保险箱</p>
-        <p className="mt-1.5 text-sm leading-6 text-emerald-800">
-          统一管理名称/地址/Key/模型，支持一键测试、模型探测和唤起 CC Switch，数据仅存浏览器本地。
-        </p>
-        <p className="mt-2 text-xs font-medium text-emerald-700/90">单条配置支持直接导出到 CC Switch。</p>
+        <button
+          type="button"
+          className="flex w-full items-start justify-between gap-3 text-left"
+          onClick={() => setIntroExpanded((prev) => !prev)}
+          aria-expanded={introExpanded}
+          aria-label={introExpanded ? "收起介绍" : "展开介绍"}
+        >
+          <div>
+            <p className="text-base font-extrabold text-emerald-900 sm:text-lg">这是你的 AI API Key 本地保险箱</p>
+            <p className="mt-1 text-xs font-medium text-emerald-700/90">
+              {introExpanded ? "点击收起介绍" : "首次已展示，后续会默认折叠；点击可再次展开"}
+            </p>
+          </div>
+          <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-emerald-200 bg-white/80 text-emerald-700">
+            {introExpanded ? <FaChevronUp aria-hidden /> : <FaChevronDown aria-hidden />}
+          </span>
+        </button>
+
+        {introExpanded ? (
+          <>
+            <p className="mt-2 text-sm leading-6 text-emerald-800">
+              统一管理名称/地址/Key/模型，支持一键测试、模型探测和唤起 CC Switch，数据仅存浏览器本地。
+            </p>
+            <p className="mt-2 text-xs font-medium text-emerald-700/90">单条配置支持直接导出到 CC Switch。</p>
+          </>
+        ) : null}
       </section>
 
       <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
