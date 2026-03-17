@@ -391,6 +391,9 @@ function getErrorMessage(error: unknown): string {
   const nestedPaths = [
     ["error", "message"],
     ["response", "error", "message"],
+    ["response", "data", "error", "message"],
+    ["response", "body", "error", "message"],
+    ["data", "error", "message"],
     ["body", "error", "message"],
     ["cause", "message"]
   ];
@@ -686,6 +689,19 @@ export default function Home() {
         messages: [{ role: "user", content: "你好，请回复：ok" }],
         max_tokens: 16
       });
+
+      // Some relay gateways return { error: {...} } with HTTP 200.
+      const responseHasError = isRecord(response) && "error" in response;
+      if (responseHasError) {
+        const responseError = getErrorMessage(response) || "模型不可用或上游渠道异常";
+        commitFinishedTestResult(item.id, {
+          status: "error",
+          message: FAIL_TEXT,
+          detail: `接口返回：${responseError}`,
+          testedAt: new Date().toISOString()
+        });
+        return false;
+      }
 
       const content = response.choices[0]?.message?.content;
       const readableText = toReadableResponseText(content);
