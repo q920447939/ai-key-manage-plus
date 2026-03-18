@@ -1,7 +1,9 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import Image from "next/image";
 import OpenAI from "openai";
+import type { EChartsOption } from "echarts";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FaBolt,
@@ -12,10 +14,12 @@ import {
   FaEdit,
   FaExchangeAlt,
   FaFileExport,
+  FaInfoCircle,
   FaKey,
   FaLink,
   FaMagic,
   FaPaste,
+  FaQuestionCircle,
   FaSave,
   FaSpinner,
   FaTag,
@@ -48,6 +52,7 @@ type KeyConfig = {
     detail?: string;
     testedAt: string;
   };
+  benchmarks?: Record<string, FinishedModelBenchmarkResult>;
 };
 
 type FormState = {
@@ -76,6 +81,61 @@ type ProbeResult = {
   testedAt?: string;
 };
 type FinishedProbeResult = NonNullable<KeyConfig["probe"]>;
+type BenchmarkRoundDetail = {
+  round: number;
+  ok: boolean;
+  elapsedMs?: number;
+  firstTokenMs?: number;
+  error?: string;
+};
+type ModelBenchmarkResult = {
+  status: TestStatus;
+  model: string;
+  tags: string[];
+  speed?: {
+    rounds: number;
+    medianMs: number;
+    avgMs: number;
+    successRate: number;
+    stabilityMs: number;
+    samplesMs: number[];
+    firstTokenMedianMs?: number;
+    firstTokenAvgMs?: number;
+    firstTokenSamplesMs?: number[];
+    roundDetails?: BenchmarkRoundDetail[];
+  };
+  detail?: string;
+  testedAt?: string;
+};
+type FinishedModelBenchmarkResult = ModelBenchmarkResult & {
+  status: "success" | "error";
+  testedAt: string;
+};
+type BenchmarkBatchProgress = {
+  configId: string;
+  models: string[];
+  rounds: number;
+  done: number;
+  total: number;
+  skipped: number;
+  currentModel?: string;
+  currentRound?: number;
+};
+type BenchmarkSummary = {
+  configId: string;
+  rounds: number;
+  models: string[];
+  totalModels: number;
+  successModels: number;
+  fastestModel?: string;
+  fastestMedianMs?: number;
+  quickestFirstTokenModel?: string;
+  quickestFirstTokenMs?: number;
+  mostStableModel?: string;
+  stabilityMs?: number;
+  recommendedModel?: string;
+  finishedAt: string;
+};
 type ParsedConfig = FormState & {
   sourceMeta?: KeyConfig["sourceMeta"];
 };
@@ -86,10 +146,21 @@ type CcSwitchAction = {
 };
 
 const STORAGE_KEY = "ai-key-vault-configs-v1";
+const LEGACY_STORAGE_KEYS = ["ai-key-vault-configs", "ai-key-check-configs-v1"];
 const INTRO_SEEN_KEY = "ai-key-vault-intro-seen-v1";
 const PASS_TEXT = "主人，快鞭策我吧";
 const FAIL_TEXT = "主人，我不行了";
 const MODEL_CANDIDATES = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5-mini", "gpt-5"];
+const DEFAULT_BENCHMARK_ROUNDS = 2;
+const MODEL_TAG_RULES: { tag: string; patterns: RegExp[] }[] = [
+  { tag: "image", patterns: [/\bimage\b/i, /\bvision\b/i, /\bvl\b/i, /\bflux\b/i, /\bsd(?:xl)?\b/i, /stable[- ]?diffusion/i] },
+  { tag: "embedding", patterns: [/embedding/i, /\bembed\b/i, /text-embedding/i, /\bbge\b/i, /\bmxbai\b/i, /\be5\b/i] },
+  { tag: "thinking", patterns: [/thinking/i, /\breason/i, /\bthink\b/i, /\bo1\b/i, /\bo3\b/i, /\bo4\b/i, /\br1\b/i] },
+  { tag: "coding", patterns: [/\bcoder\b/i, /\bcoding\b/i, /\bcode\b/i, /devstral/i] },
+  { tag: "audio", patterns: [/\baudio\b/i, /\bspeech\b/i, /\btts\b/i, /whisper/i, /transcri/i] },
+  { tag: "rerank", patterns: [/rerank/i, /reranker/i] },
+  { tag: "moderation", patterns: [/moderation/i] }
+];
 const CC_SWITCH_APPS: { value: CcSwitchApp; label: string }[] = [
   { value: "claude", label: "Claude" },
   { value: "codex", label: "Codex" },
@@ -116,8 +187,7 @@ const smallDangerBtn =
   "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:border-red-700 hover:bg-red-700 hover:text-white";
 const iconCopyBtn =
   "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45";
-const modalIconBtn =
-  "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-zinc-200 bg-white text-[11px] text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-45";
+const ReactECharts = dynamic(() => import("echarts-for-react"), { ssr: false });
 
 function normalizeBaseUrl(raw: string): string {
   const cleaned = raw.trim().replace(/\/+$/, "");
@@ -174,6 +244,19 @@ function collectGlobalMatches(text: string, regex: RegExp, group = 0): string[] 
   return out;
 }
 
+function normalizeParsedFieldValue(input: string): string {
+  return input
+    .trim()
+    .replace(/^[`'"]+/, "")
+    .replace(/[`'"]+$/, "")
+    .replace(/[;,]+$/, "")
+    .trim();
+}
+
+function normalizeParsedModelValue(input: string): string {
+  return normalizeParsedFieldValue(input).replace(/\s+/g, "");
+}
+
 function parseSingleSegment(input: string): Partial<ParsedConfig> {
   const text = input.trim();
   if (!text) return {};
@@ -205,8 +288,8 @@ function parseSingleSegment(input: string): Partial<ParsedConfig> {
     if (hostLike?.[0]) out.baseUrl = normalizeBaseUrl(hostLike[0]);
   }
 
-  const modelMatch = text.match(/(?:model|model_name)["'\s:=]+([A-Za-z0-9._:-]{2,})/i);
-  if (modelMatch?.[1]) out.model = modelMatch[1].trim();
+  const modelMatch = text.match(/(?:^|\n|\r|[,{])\s*(?:model|model_name|modelName|default_model|defaultModel|模型)\s*["']?\s*[:=]\s*["'`]?([^"'`\n\r,}]+)["'`]?/i);
+  if (modelMatch?.[1]) out.model = normalizeParsedModelValue(modelMatch[1]);
 
   return out;
 }
@@ -225,13 +308,13 @@ function parseObjectConfig(item: unknown): Partial<FormState> {
     obj.access_token ??
     obj.authorization ??
     obj.auth;
-  const rawModel = obj.model ?? obj.model_name ?? obj.modelName;
+  const rawModel = obj.model ?? obj.model_name ?? obj.modelName ?? obj.default_model ?? obj.defaultModel;
 
   return {
     name: "",
     baseUrl: rawBaseUrl ? normalizeBaseUrl(String(rawBaseUrl)) : "",
     apiKey: rawApiKey ? cleanKey(String(rawApiKey)) : "",
-    model: rawModel ? String(rawModel).trim() : ""
+    model: rawModel ? normalizeParsedModelValue(String(rawModel)) : ""
   };
 }
 
@@ -309,7 +392,7 @@ function parseCcSwitchTextBlock(input: string): Partial<ParsedConfig> {
   const nameMatch = text.match(/(?:^|\n)\s*name\s*[:=]\s*(.+?)(?:\n|$)/i);
   const endpointMatch = text.match(/(?:^|\n)\s*endpoint\s*[:=]\s*(.+?)(?:\n|$)/i);
   const keyMatch = text.match(/(?:^|\n)\s*apiKey\s*[:=]\s*(.+?)(?:\n|$)/i);
-  const modelMatch = text.match(/(?:^|\n)\s*model\s*[:=]\s*(.+?)(?:\n|$)/i);
+  const modelMatch = text.match(/(?:^|\n)\s*(?:model|模型)\s*[:=]\s*(.+?)(?:\n|$)/i);
 
   if (!appMatch && !endpointMatch && !keyMatch && !modelMatch) return {};
 
@@ -323,7 +406,7 @@ function parseCcSwitchTextBlock(input: string): Partial<ParsedConfig> {
     name: (nameMatch?.[1] || "").trim(),
     baseUrl: normalizeBaseUrl(endpoint || ""),
     apiKey: cleanKey(keyMatch?.[1] || ""),
-    model: (modelMatch?.[1] || "").trim(),
+    model: normalizeParsedModelValue(modelMatch?.[1] || ""),
     sourceMeta: {
       kind: "cc-switch-provider",
       ccSwitchApp: isCcSwitchApp(app) ? app : undefined
@@ -413,9 +496,8 @@ function parsePastedConfigs(input: string, startIndex: number): ParsedConfig[] {
     ...collectGlobalMatches(text, /(?:sk|rk|ak|pk)[-_][A-Za-z0-9._-]{8,}/gi)
   ].map(cleanKey);
   const globalModels = [
-    ...collectGlobalMatches(text, /(?:model|model_name)["'\s:=]+([A-Za-z0-9._:-]{2,})/gi, 1),
-    ...collectGlobalMatches(text, /"model"\s*:\s*"([^"]+)"/gi, 1)
-  ];
+    ...collectGlobalMatches(text, /(?:^|\n|\r|[,{])\s*(?:model|model_name|modelName|default_model|defaultModel|模型)\s*["']?\s*[:=]\s*["'`]?([^"'`\n\r,}]+)["'`]?/gi, 1)
+  ].map(normalizeParsedModelValue);
 
   const paired: Partial<FormState>[] = [];
   const pairCount = Math.max(globalUrls.length, globalKeys.length, globalModels.length);
@@ -483,6 +565,10 @@ function cleanOneLineText(input: string, maxLen = 220): string {
   return `${singleLine.slice(0, maxLen)}...`;
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.map((item) => item.trim()).filter(Boolean))];
+}
+
 function toReadableResponseText(content: unknown): string {
   if (typeof content === "string") return cleanOneLineText(content);
   if (!Array.isArray(content)) return "";
@@ -503,6 +589,75 @@ function safeDateToIso(input: unknown): string {
   if (typeof input !== "string") return "";
   const d = new Date(input);
   return Number.isNaN(d.getTime()) ? "" : d.toISOString();
+}
+
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function normalizeBenchmarkRoundDetail(input: unknown, index = 0): BenchmarkRoundDetail | undefined {
+  if (!isRecord(input)) return undefined;
+
+  const roundRaw = typeof input.round === "number" && Number.isFinite(input.round) ? Math.round(input.round) : index + 1;
+  const ok = typeof input.ok === "boolean" ? input.ok : typeof input.elapsedMs === "number" && Number.isFinite(input.elapsedMs);
+  const elapsedMs =
+    typeof input.elapsedMs === "number" && Number.isFinite(input.elapsedMs) ? Math.max(0, Math.round(input.elapsedMs)) : undefined;
+  const firstTokenMs =
+    typeof input.firstTokenMs === "number" && Number.isFinite(input.firstTokenMs)
+      ? Math.max(0, Math.round(input.firstTokenMs))
+      : undefined;
+  const error = typeof input.error === "string" && input.error.trim() ? cleanOneLineText(input.error, 260) : undefined;
+
+  return {
+    round: Math.max(1, roundRaw),
+    ok,
+    elapsedMs,
+    firstTokenMs,
+    error
+  };
+}
+
+function buildRoundDetailsFromSamples(
+  rounds: number,
+  elapsedSamples: number[],
+  firstTokenSamples: number[] = [],
+  errors: string[] = []
+): BenchmarkRoundDetail[] {
+  const out: BenchmarkRoundDetail[] = [];
+
+  for (let index = 0; index < rounds; index += 1) {
+    const elapsedMs = elapsedSamples[index];
+    const firstTokenMs = firstTokenSamples[index];
+    const error = errors[index];
+
+    out.push({
+      round: index + 1,
+      ok: typeof elapsedMs === "number",
+      elapsedMs,
+      firstTokenMs: typeof firstTokenMs === "number" ? firstTokenMs : undefined,
+      error: typeof elapsedMs === "number" ? undefined : error
+    });
+  }
+
+  return out;
+}
+
+function getBenchmarkRoundDetails(result?: ModelBenchmarkResult): BenchmarkRoundDetail[] {
+  if (!result?.speed) return [];
+
+  if (Array.isArray(result.speed.roundDetails) && result.speed.roundDetails.length > 0) {
+    return [...result.speed.roundDetails].sort((left, right) => left.round - right.round);
+  }
+
+  return buildRoundDetailsFromSamples(
+    result.speed.rounds,
+    result.speed.samplesMs,
+    result.speed.firstTokenSamplesMs,
+    []
+  );
 }
 
 function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undefined {
@@ -547,6 +702,287 @@ function normalizeFinishedProbeResult(input: unknown): FinishedProbeResult | und
     detail: detail || undefined,
     testedAt
   };
+}
+
+function normalizeBenchmarkSpeed(input: unknown): FinishedModelBenchmarkResult["speed"] | undefined {
+  if (!isRecord(input)) return undefined;
+
+  const roundDetails = Array.isArray(input.roundDetails)
+    ? input.roundDetails
+        .map((item, index) => normalizeBenchmarkRoundDetail(item, index))
+        .filter((item): item is BenchmarkRoundDetail => Boolean(item))
+        .sort((left, right) => left.round - right.round)
+    : [];
+  const successRate =
+    typeof input.successRate === "number" && Number.isFinite(input.successRate) ? Math.min(1, Math.max(0, input.successRate)) : 0;
+  const samplesMs = Array.isArray(input.samplesMs)
+    ? input.samplesMs
+        .map((item) => (typeof item === "number" && Number.isFinite(item) ? Math.max(0, Math.round(item)) : 0))
+        .filter((item) => item > 0)
+    : roundDetails.map((item) => item.elapsedMs).filter((item): item is number => typeof item === "number");
+  const firstTokenSamplesMs = Array.isArray(input.firstTokenSamplesMs)
+    ? input.firstTokenSamplesMs
+        .map((item) => (typeof item === "number" && Number.isFinite(item) ? Math.max(0, Math.round(item)) : 0))
+        .filter((item) => item > 0)
+    : roundDetails.map((item) => item.firstTokenMs).filter((item): item is number => typeof item === "number");
+  const rounds = typeof input.rounds === "number" && Number.isFinite(input.rounds) ? Math.max(1, Math.round(input.rounds)) : roundDetails.length || samplesMs.length;
+  const medianMsCandidate =
+    typeof input.medianMs === "number" && Number.isFinite(input.medianMs) ? Math.max(0, Math.round(input.medianMs)) : 0;
+  const avgMsCandidate = typeof input.avgMs === "number" && Number.isFinite(input.avgMs) ? Math.max(0, Math.round(input.avgMs)) : 0;
+  const medianMs = medianMsCandidate || (samplesMs.length > 0 ? medianOf(samplesMs) : 0);
+  const avgMs = avgMsCandidate || (samplesMs.length > 0 ? averageOf(samplesMs) : 0);
+  const stabilityMs =
+    typeof input.stabilityMs === "number" && Number.isFinite(input.stabilityMs)
+      ? Math.max(0, Math.round(input.stabilityMs))
+      : computeStability(samplesMs);
+  const firstTokenMedianMs =
+    typeof input.firstTokenMedianMs === "number" && Number.isFinite(input.firstTokenMedianMs)
+      ? Math.max(0, Math.round(input.firstTokenMedianMs))
+      : firstTokenSamplesMs.length > 0
+        ? medianOf(firstTokenSamplesMs)
+        : undefined;
+  const firstTokenAvgMs =
+    typeof input.firstTokenAvgMs === "number" && Number.isFinite(input.firstTokenAvgMs)
+      ? Math.max(0, Math.round(input.firstTokenAvgMs))
+      : firstTokenSamplesMs.length > 0
+        ? averageOf(firstTokenSamplesMs)
+        : undefined;
+
+  if (!rounds || !medianMs || !avgMs) return undefined;
+
+  return {
+    rounds,
+    medianMs,
+    avgMs,
+    successRate: successRate || (samplesMs.length > 0 ? Math.min(1, samplesMs.length / rounds) : 0),
+    stabilityMs,
+    samplesMs,
+    firstTokenMedianMs,
+    firstTokenAvgMs,
+    firstTokenSamplesMs: firstTokenSamplesMs.length > 0 ? firstTokenSamplesMs : undefined,
+    roundDetails: roundDetails.length > 0 ? roundDetails : buildRoundDetailsFromSamples(rounds, samplesMs, firstTokenSamplesMs)
+  };
+}
+
+function inferModelTags(model: string): string[] {
+  const normalized = model.trim();
+  if (!normalized) return [];
+
+  const out: string[] = [];
+  for (const rule of MODEL_TAG_RULES) {
+    if (rule.patterns.some((pattern) => pattern.test(normalized))) {
+      out.push(rule.tag);
+    }
+  }
+
+  return uniqueStrings(out);
+}
+
+function stripCodeFence(text: string): string {
+  return text.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
+}
+
+function normalizeFinishedBenchmarkResult(
+  input: unknown,
+  modelKey: string
+): FinishedModelBenchmarkResult | undefined {
+  if (!isRecord(input)) return undefined;
+
+  const status = input.status;
+  if (status !== "success" && status !== "error") return undefined;
+
+  const model = typeof input.model === "string" && input.model.trim() ? input.model.trim() : modelKey.trim();
+  if (!model) return undefined;
+
+  const tags = Array.isArray(input.tags) ? uniqueStrings(input.tags.map((item) => String(item))) : inferModelTags(model);
+  const speed = normalizeBenchmarkSpeed(input.speed);
+  const detail = typeof input.detail === "string" && input.detail.trim() ? cleanOneLineText(input.detail, 360) : "";
+  const testedAt = safeDateToIso(input.testedAt);
+
+  if (!testedAt) return undefined;
+
+  return {
+    status,
+    model,
+    tags,
+    speed,
+    detail: detail || undefined,
+    testedAt
+  };
+}
+
+function normalizeStoredBenchmarks(input: unknown): KeyConfig["benchmarks"] | undefined {
+  const out: Record<string, FinishedModelBenchmarkResult> = {};
+  const entries = Array.isArray(input)
+    ? input
+        .map((item, index) => {
+          const model = isRecord(item) ? firstNonEmptyString(item.model, item.name, item.id) : "";
+          return model ? [model || String(index), item] : null;
+        })
+        .filter((item): item is [string, unknown] => Boolean(item))
+    : isRecord(input)
+      ? Object.entries(input)
+      : [];
+
+  for (const [modelKey, value] of entries) {
+    const normalized = normalizeFinishedBenchmarkResult(value, modelKey);
+    if (!normalized) continue;
+    out[normalized.model] = normalized;
+  }
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function isLikelyChatBenchmarkable(model: string, tags?: string[]): boolean {
+  const normalized = model.trim().toLowerCase();
+  const resolvedTags = tags || inferModelTags(model);
+
+  if (resolvedTags.includes("embedding") || resolvedTags.includes("image") || resolvedTags.includes("rerank") || resolvedTags.includes("moderation")) {
+    return false;
+  }
+
+  return !/(whisper|transcri|text-embedding|embedding-|rerank|stable-diffusion|sdxl|flux|moderation)/i.test(normalized);
+}
+
+function medianOf(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[middle];
+  return Math.round((sorted[middle - 1] + sorted[middle]) / 2);
+}
+
+function averageOf(values: number[]): number {
+  if (values.length === 0) return 0;
+  return Math.round(values.reduce((sum, item) => sum + item, 0) / values.length);
+}
+
+function computeStability(values: number[]): number {
+  if (values.length <= 1) return 0;
+  return Math.max(...values) - Math.min(...values);
+}
+
+function formatDurationLabel(ms?: number): string {
+  if (!ms || !Number.isFinite(ms)) return "-";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+function formatSuccessRateLabel(rate?: number): string {
+  if (typeof rate !== "number" || !Number.isFinite(rate)) return "-";
+  return `${Math.round(rate * 100)}%`;
+}
+
+function getBenchmarkRounds(input: string | number): number {
+  const numeric = typeof input === "number" ? input : Number.parseInt(String(input).trim(), 10);
+  if (!Number.isFinite(numeric)) return DEFAULT_BENCHMARK_ROUNDS;
+  return Math.min(3, Math.max(1, Math.round(numeric)));
+}
+
+function defaultModelBenchmarkResult(model: string): ModelBenchmarkResult {
+  return { status: "idle", model, tags: inferModelTags(model) };
+}
+
+function benchmarkStatusLabel(result: ModelBenchmarkResult): string {
+  if (result.status === "pending") return "测试中...";
+  if (result.status === "success") return "已测试";
+  if (result.status === "error") return "测试失败";
+  return "未测试";
+}
+
+function collectFinishedBenchmarks(item: KeyConfig, runtimeBenchmarks?: Record<string, ModelBenchmarkResult>) {
+  const merged = {
+    ...(item.benchmarks || {}),
+    ...(runtimeBenchmarks || {})
+  };
+
+  return Object.values(merged).filter(
+    (benchmark): benchmark is FinishedModelBenchmarkResult => benchmark.status === "success"
+  );
+}
+
+function buildBenchmarkSummary(
+  configId: string,
+  results: FinishedModelBenchmarkResult[],
+  fallbackRounds = DEFAULT_BENCHMARK_ROUNDS,
+  scopeModels: string[] = []
+): BenchmarkSummary | null {
+  const modelList = uniqueStrings(scopeModels.length > 0 ? scopeModels : results.map((item) => item.model));
+  if (results.length === 0 && modelList.length === 0) return null;
+
+  const successfulBenchmarks = results.filter((item) => item.status === "success" && item.speed);
+  const fastest = pickFastestBenchmark(successfulBenchmarks);
+  const quickestFirstToken = pickQuickestFirstTokenBenchmark(successfulBenchmarks);
+  const mostStable = pickMostStableBenchmark(successfulBenchmarks);
+  const recommended = pickRecommendedBenchmark(successfulBenchmarks);
+  const finishedAt = [...results]
+    .map((item) => item.testedAt)
+    .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0];
+
+  return {
+    configId,
+    rounds: Math.max(
+      1,
+      ...results.map((item) => item.speed?.rounds || 0),
+      fallbackRounds
+    ),
+    models: modelList,
+    totalModels: modelList.length,
+    successModels: successfulBenchmarks.length,
+    fastestModel: fastest?.model,
+    fastestMedianMs: fastest?.speed?.medianMs,
+    quickestFirstTokenModel: quickestFirstToken?.model,
+    quickestFirstTokenMs: quickestFirstToken?.speed?.firstTokenMedianMs,
+    mostStableModel: mostStable?.model,
+    stabilityMs: mostStable?.speed?.stabilityMs,
+    recommendedModel: recommended?.model,
+    finishedAt: finishedAt || new Date().toISOString()
+  };
+}
+
+function pickFastestBenchmark(benchmarks: FinishedModelBenchmarkResult[]): FinishedModelBenchmarkResult | undefined {
+  return [...benchmarks]
+    .filter((item) => typeof item.speed?.medianMs === "number")
+    .sort((left, right) => (left.speed?.medianMs || Number.POSITIVE_INFINITY) - (right.speed?.medianMs || Number.POSITIVE_INFINITY))[0];
+}
+
+function pickQuickestFirstTokenBenchmark(benchmarks: FinishedModelBenchmarkResult[]): FinishedModelBenchmarkResult | undefined {
+  return [...benchmarks]
+    .filter((item) => typeof item.speed?.firstTokenMedianMs === "number")
+    .sort(
+      (left, right) =>
+        (left.speed?.firstTokenMedianMs || Number.POSITIVE_INFINITY) -
+        (right.speed?.firstTokenMedianMs || Number.POSITIVE_INFINITY)
+    )[0];
+}
+
+function pickMostStableBenchmark(benchmarks: FinishedModelBenchmarkResult[]): FinishedModelBenchmarkResult | undefined {
+  return [...benchmarks]
+    .filter((item) => typeof item.speed?.stabilityMs === "number")
+    .sort((left, right) => (left.speed?.stabilityMs || Number.POSITIVE_INFINITY) - (right.speed?.stabilityMs || Number.POSITIVE_INFINITY))[0];
+}
+
+function pickRecommendedBenchmark(benchmarks: FinishedModelBenchmarkResult[]): FinishedModelBenchmarkResult | undefined {
+  const ranked = [...benchmarks]
+    .filter((item) => item.speed)
+    .sort((left, right) => {
+      const leftScore = (left.speed?.successRate || 0) * 100000 - (left.speed?.medianMs || 0) - (left.speed?.stabilityMs || 0) * 2;
+      const rightScore = (right.speed?.successRate || 0) * 100000 - (right.speed?.medianMs || 0) - (right.speed?.stabilityMs || 0) * 2;
+      return rightScore - leftScore;
+    });
+
+  return ranked[0];
+}
+
+function getTagClassName(tag: string): string {
+  if (tag === "image") return "border-rose-200 bg-rose-50 text-rose-700";
+  if (tag === "embedding") return "border-sky-200 bg-sky-50 text-sky-700";
+  if (tag === "thinking") return "border-amber-200 bg-amber-50 text-amber-700";
+  if (tag === "coding") return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (tag === "audio") return "border-violet-200 bg-violet-50 text-violet-700";
+  if (tag === "rerank") return "border-zinc-300 bg-zinc-100 text-zinc-700";
+  if (tag === "moderation") return "border-red-200 bg-red-50 text-red-700";
+  return "border-zinc-200 bg-zinc-50 text-zinc-600";
 }
 
 function normalizeSourceMeta(input: unknown): KeyConfig["sourceMeta"] | undefined {
@@ -687,6 +1123,200 @@ function makeOpenAIClient(baseUrl: string, apiKey: string) {
   });
 }
 
+async function requestModelText(
+  client: OpenAI,
+  model: string,
+  prompt: string,
+  maxTokens: number
+): Promise<{ ok: boolean; text: string; elapsedMs: number; error?: string }> {
+  const startedAt = performance.now();
+
+  try {
+    const response = await client.chat.completions.create({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens
+    });
+
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    const responseHasError = isRecord(response) && "error" in response;
+    if (responseHasError) {
+      return {
+        ok: false,
+        text: "",
+        elapsedMs,
+        error: getErrorMessage(response) || "模型不可用或上游渠道异常"
+      };
+    }
+
+    const content = response.choices[0]?.message?.content;
+    const text = toReadableResponseText(content);
+    if (text || content) {
+      return { ok: true, text, elapsedMs };
+    }
+
+    return { ok: false, text: "", elapsedMs, error: "未返回消息内容" };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      text: "",
+      elapsedMs: Math.round(performance.now() - startedAt),
+      error: makeErrorDetail(error)
+    };
+  }
+}
+
+function extractStreamDeltaText(payload: unknown): string {
+  if (!isRecord(payload) || !Array.isArray(payload.choices)) return "";
+
+  const firstChoice = payload.choices[0];
+  if (!isRecord(firstChoice)) return "";
+
+  const delta = firstChoice.delta;
+  if (!isRecord(delta)) return "";
+
+  const directContent = delta.content;
+  if (typeof directContent === "string") return directContent;
+
+  if (Array.isArray(directContent)) {
+    return directContent
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (!isRecord(part)) return "";
+        return typeof part.text === "string" ? part.text : "";
+      })
+      .join("");
+  }
+
+  const reasoningContent = delta.reasoning_content;
+  if (typeof reasoningContent === "string") return reasoningContent;
+
+  return "";
+}
+
+async function readStreamError(response: Response): Promise<string> {
+  try {
+    const payload = (await response.clone().json()) as unknown;
+    const message = getErrorMessage(payload);
+    if (message) return message;
+  } catch {
+    // Ignore parse errors and fall back to raw text.
+  }
+
+  try {
+    const rawText = await response.text();
+    const cleaned = cleanOneLineText(rawText, 260);
+    if (cleaned) return cleaned;
+  } catch {
+    // Ignore read errors and fall back to status code.
+  }
+
+  return `HTTP ${response.status}`;
+}
+
+async function requestModelTextStream(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  prompt: string,
+  maxTokens: number
+): Promise<{ ok: boolean; text: string; elapsedMs: number; firstTokenMs?: number; error?: string }> {
+  const startedAt = performance.now();
+
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: maxTokens,
+        stream: true
+      })
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        text: "",
+        elapsedMs: Math.round(performance.now() - startedAt),
+        error: await readStreamError(response)
+      };
+    }
+
+    if (!response.body) {
+      return {
+        ok: false,
+        text: "",
+        elapsedMs: Math.round(performance.now() - startedAt),
+        error: "流式响应不可用"
+      };
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let collectedText = "";
+    let firstTokenMs: number | undefined;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split("\n\n");
+      buffer = chunks.pop() || "";
+
+      for (const chunk of chunks) {
+        const lines = chunk
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.startsWith("data:"));
+
+        for (const line of lines) {
+          const data = line.replace(/^data:\s*/, "");
+          if (!data || data === "[DONE]") continue;
+
+          try {
+            const payload = JSON.parse(data) as unknown;
+            const deltaText = extractStreamDeltaText(payload);
+            if (!deltaText) continue;
+            if (firstTokenMs === undefined) {
+              firstTokenMs = Math.round(performance.now() - startedAt);
+            }
+            collectedText += deltaText;
+          } catch {
+            // Ignore malformed SSE events from relays and continue reading.
+          }
+        }
+      }
+    }
+
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    const text = cleanOneLineText(stripCodeFence(collectedText), 260);
+    if (!text) {
+      return { ok: false, text: "", elapsedMs, error: "流式响应未返回可读内容" };
+    }
+
+    return {
+      ok: true,
+      text,
+      elapsedMs,
+      firstTokenMs
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      text: "",
+      elapsedMs: Math.round(performance.now() - startedAt),
+      error: makeErrorDetail(error)
+    };
+  }
+}
+
 function getErrorMessage(error: unknown): string {
   if (!isRecord(error)) return "";
 
@@ -737,29 +1367,73 @@ function makeErrorDetail(error: unknown): string {
   return `${detail}；接口返回：${raw}`;
 }
 
+function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | undefined {
+  if (!isRecord(input)) return undefined;
+
+  const id = typeof input.id === "string" && input.id ? input.id : crypto.randomUUID();
+  const rawName = firstNonEmptyString(input.name, input.title, input.label);
+  const baseUrl = normalizeBaseUrl(
+    firstNonEmptyString(input.baseUrl, input.baseURL, input.url, input.endpoint, input.apiBaseUrl, input.api_url)
+  );
+  const apiKey = cleanKey(firstNonEmptyString(input.apiKey, input.api_key, input.key, input.token));
+  const model = firstNonEmptyString(input.model, input.modelName, input.defaultModel, input.default_model);
+  const createdAt = safeDateToIso(input.createdAt) || safeDateToIso(input.updatedAt) || new Date().toISOString();
+  const sourceMeta = normalizeSourceMeta(input.sourceMeta);
+  const probe = normalizeFinishedProbeResult(input.probe || input.probeResult || input.modelProbe);
+  const lastTest = normalizeFinishedTestResult(input.lastTest || input.lastResult || input.testResult);
+  const benchmarks = normalizeStoredBenchmarks(input.benchmarks || input.modelBenchmarks || input.benchmarkResults);
+  const hasCoreValue = Boolean(rawName || baseUrl || apiKey || model || probe || lastTest || benchmarks);
+
+  if (!hasCoreValue) return undefined;
+
+  const name = rawName || makeDefaultName(index + 1);
+  return { id, name, baseUrl, apiKey, model, createdAt, sourceMeta, probe, lastTest, benchmarks };
+}
+
+function toStoredConfigCandidates(parsed: unknown): unknown[] {
+  if (Array.isArray(parsed)) return parsed;
+  if (!isRecord(parsed)) return [];
+
+  if (Array.isArray(parsed.configs)) return parsed.configs;
+  if (Array.isArray(parsed.items)) return parsed.items;
+  if (Array.isArray(parsed.data)) return parsed.data;
+
+  const recordValues = Object.values(parsed).filter((item) => isRecord(item));
+  if (recordValues.length > 0) return recordValues;
+
+  return [];
+}
+
 function normalizeStoredConfigs(raw: string): KeyConfig[] {
   const parsed = JSON.parse(raw) as unknown;
-  if (!Array.isArray(parsed)) return [];
-
+  const candidates = toStoredConfigCandidates(parsed);
   const normalized: KeyConfig[] = [];
-  for (let index = 0; index < parsed.length; index += 1) {
-    const item = parsed[index];
-    if (!isRecord(item)) continue;
-
-    const id = typeof item.id === "string" && item.id ? item.id : crypto.randomUUID();
-    const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : makeDefaultName(index + 1);
-    const baseUrl = normalizeBaseUrl(typeof item.baseUrl === "string" ? item.baseUrl : "");
-    const apiKey = cleanKey(typeof item.apiKey === "string" ? item.apiKey : "");
-    const model = typeof item.model === "string" ? item.model.trim() : "";
-    const createdAt = safeDateToIso(item.createdAt) || new Date().toISOString();
-    const sourceMeta = normalizeSourceMeta(item.sourceMeta);
-    const probe = normalizeFinishedProbeResult(item.probe);
-    const lastTest = normalizeFinishedTestResult(item.lastTest);
-
-    normalized.push({ id, name, baseUrl, apiKey, model, createdAt, sourceMeta, probe, lastTest });
+  for (let index = 0; index < candidates.length; index += 1) {
+    const item = normalizeStoredConfigItem(candidates[index], index);
+    if (item) normalized.push(item);
   }
 
   return normalized;
+}
+
+function loadConfigsFromStorage(storage: Storage): { configs: KeyConfig[]; sourceKey?: string } {
+  const candidateKeys = [STORAGE_KEY, ...LEGACY_STORAGE_KEYS];
+
+  for (const key of candidateKeys) {
+    const raw = storage.getItem(key);
+    if (!raw) continue;
+
+    try {
+      const configs = normalizeStoredConfigs(raw);
+      if (configs.length > 0) {
+        return { configs, sourceKey: key };
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { configs: [] };
 }
 
 function defaultTestResult(): TestResult {
@@ -780,6 +1454,24 @@ function StatusIcon({ status }: { status: TestStatus }) {
   return <FaVial aria-hidden />;
 }
 
+function HelpHint({ text }: { text: string }) {
+  return (
+    <span className="group relative inline-flex">
+      <span
+        className="inline-flex h-4 w-4 cursor-help items-center justify-center rounded-full text-zinc-400 transition hover:text-zinc-700"
+        aria-label={text}
+        title={text}
+        tabIndex={0}
+      >
+        <FaQuestionCircle aria-hidden />
+      </span>
+      <span className="pointer-events-none absolute left-1/2 top-full z-20 mt-2 hidden w-56 -translate-x-1/2 rounded-xl border border-zinc-200 bg-zinc-900 px-3 py-2 text-[11px] leading-5 text-white shadow-xl group-hover:block group-focus-within:block">
+        {text}
+      </span>
+    </span>
+  );
+}
+
 export default function Home() {
   const [configs, setConfigs] = useState<KeyConfig[]>([]);
   const [form, setForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "" });
@@ -788,6 +1480,7 @@ export default function Home() {
   const [loadingMap, setLoadingMap] = useState<Record<string, boolean>>({});
   const [resultMap, setResultMap] = useState<Record<string, TestResult>>({});
   const [probeMap, setProbeMap] = useState<Record<string, ProbeResult>>({});
+  const [benchmarkMap, setBenchmarkMap] = useState<Record<string, Record<string, ModelBenchmarkResult>>>({});
   const [notice, setNotice] = useState("");
   const [testingAll, setTestingAll] = useState(false);
   const [probingAll, setProbingAll] = useState(false);
@@ -798,15 +1491,24 @@ export default function Home() {
   const [ccSwitchDialogId, setCcSwitchDialogId] = useState<string | null>(null);
   const [ccSwitchTargetApp, setCcSwitchTargetApp] = useState<CcSwitchApp>("codex");
   const [probeDialogId, setProbeDialogId] = useState<string | null>(null);
+  const [benchmarkDialogId, setBenchmarkDialogId] = useState<string | null>(null);
+  const [benchmarkSearch, setBenchmarkSearch] = useState("");
+  const [benchmarkRoundsInput, setBenchmarkRoundsInput] = useState(String(DEFAULT_BENCHMARK_ROUNDS));
+  const [selectedProbeModels, setSelectedProbeModels] = useState<string[]>([]);
+  const [benchmarkBatch, setBenchmarkBatch] = useState<BenchmarkBatchProgress | null>(null);
+  const [benchmarkSummaryMap, setBenchmarkSummaryMap] = useState<Record<string, BenchmarkSummary>>({});
+  const [benchmarkChartModel, setBenchmarkChartModel] = useState("");
+  const [benchmarkListCollapsed, setBenchmarkListCollapsed] = useState(false);
+  const [benchmarkDetailModel, setBenchmarkDetailModel] = useState("");
   const [introExpanded, setIntroExpanded] = useState(false);
 
   useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    try {
-      setConfigs(normalizeStoredConfigs(raw));
-    } catch {
-      setConfigs([]);
+    const { configs: restoredConfigs, sourceKey } = loadConfigsFromStorage(localStorage);
+    if (restoredConfigs.length === 0) return;
+
+    setConfigs(restoredConfigs);
+    if (sourceKey && sourceKey !== STORAGE_KEY) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(restoredConfigs));
     }
   }, []);
 
@@ -834,6 +1536,352 @@ export default function Home() {
     [configs, ccSwitchDialogId]
   );
   const probeDialogItem = useMemo(() => configs.find((item) => item.id === probeDialogId) || null, [configs, probeDialogId]);
+  const benchmarkDialogItem = useMemo(
+    () => configs.find((item) => item.id === benchmarkDialogId) || null,
+    [benchmarkDialogId, configs]
+  );
+  const activeProbeDialogProbe = useMemo(() => {
+    if (!benchmarkDialogItem) return defaultProbeResult();
+    return probeMap[benchmarkDialogItem.id] || benchmarkDialogItem.probe || defaultProbeResult();
+  }, [benchmarkDialogItem, probeMap]);
+  const probeDialogModels = useMemo(() => {
+    if (!benchmarkDialogItem) return [];
+
+    const benchmarkByModel = {
+      ...(benchmarkDialogItem.benchmarks || {}),
+      ...(benchmarkMap[benchmarkDialogItem.id] || {})
+    };
+
+    return activeProbeDialogProbe.supportedModels.map((model) => {
+      const tags = inferModelTags(model);
+      const benchmark = benchmarkByModel[model] || defaultModelBenchmarkResult(model);
+      return {
+        model,
+        tags,
+        benchmark,
+        benchmarkable: isLikelyChatBenchmarkable(model, tags),
+        isCurrent: benchmarkDialogItem.model === model
+      };
+    });
+  }, [activeProbeDialogProbe, benchmarkDialogItem, benchmarkMap]);
+  const benchmarkRounds = useMemo(() => getBenchmarkRounds(benchmarkRoundsInput), [benchmarkRoundsInput]);
+  const filteredProbeModels = useMemo(() => {
+    const query = benchmarkSearch.trim().toLowerCase();
+    return [...probeDialogModels]
+      .filter((item) => !query || item.model.toLowerCase().includes(query) || item.tags.some((tag) => tag.toLowerCase().includes(query)))
+      .sort((left, right) => {
+        if (left.isCurrent !== right.isCurrent) return left.isCurrent ? -1 : 1;
+        return left.model.localeCompare(right.model);
+      });
+  }, [benchmarkSearch, probeDialogModels]);
+  const visibleBenchmarkableModels = useMemo(
+    () => filteredProbeModels.filter((item) => item.benchmarkable).map((item) => item.model),
+    [filteredProbeModels]
+  );
+  const selectedBenchmarkableModels = useMemo(
+    () =>
+      probeDialogModels
+        .filter((item) => selectedProbeModels.includes(item.model) && item.benchmarkable)
+        .map((item) => item.model),
+    [probeDialogModels, selectedProbeModels]
+  );
+  const benchmarkActionModels = selectedBenchmarkableModels.length > 0 ? selectedBenchmarkableModels : visibleBenchmarkableModels;
+  const activeBenchmarkBatch =
+    benchmarkDialogItem && benchmarkBatch?.configId === benchmarkDialogItem.id ? benchmarkBatch : null;
+  const activeBenchmarkProgressPercent = useMemo(() => {
+    if (!activeBenchmarkBatch) return 0;
+    const totalRounds = Math.max(1, activeBenchmarkBatch.total * activeBenchmarkBatch.rounds);
+    const completedRounds = activeBenchmarkBatch.done * activeBenchmarkBatch.rounds;
+    const currentRound = activeBenchmarkBatch.currentRound ? Math.max(0, activeBenchmarkBatch.currentRound - 1) : 0;
+    return Math.min(100, Math.round(((completedRounds + currentRound) / totalRounds) * 100));
+  }, [activeBenchmarkBatch]);
+  const mergedBenchmarkByModel = useMemo(
+    () =>
+      benchmarkDialogItem
+        ? {
+            ...(benchmarkDialogItem.benchmarks || {}),
+            ...(benchmarkMap[benchmarkDialogItem.id] || {})
+          }
+        : {},
+    [benchmarkDialogItem, benchmarkMap]
+  );
+  const allFinishedBenchmarkResults = useMemo(() => {
+    const modelsFromProbe = probeDialogModels.map((item) => item.model);
+    const modelsFromResults = Object.keys(mergedBenchmarkByModel);
+    const models = uniqueStrings([...modelsFromProbe, ...modelsFromResults]);
+
+    return models
+      .map((model) => {
+        const result = mergedBenchmarkByModel[model];
+        return result && (result.status === "success" || result.status === "error") ? result : null;
+      })
+      .filter((item): item is FinishedModelBenchmarkResult => Boolean(item))
+      .sort((left, right) => {
+        const leftCurrent = benchmarkDialogItem?.model === left.model;
+        const rightCurrent = benchmarkDialogItem?.model === right.model;
+        if (leftCurrent !== rightCurrent) return leftCurrent ? -1 : 1;
+        return new Date(right.testedAt).getTime() - new Date(left.testedAt).getTime();
+      });
+  }, [benchmarkDialogItem?.model, mergedBenchmarkByModel, probeDialogModels]);
+  const storedBenchmarkSummary = useMemo(() => {
+    if (!benchmarkDialogItem) return null;
+    return (
+      benchmarkSummaryMap[benchmarkDialogItem.id] ||
+      buildBenchmarkSummary(benchmarkDialogItem.id, allFinishedBenchmarkResults, benchmarkRounds)
+    );
+  }, [benchmarkDialogItem, allFinishedBenchmarkResults, benchmarkRounds, benchmarkSummaryMap]);
+  const activeBenchmarkScopeModels = useMemo(() => {
+    if (activeBenchmarkBatch?.models.length) return activeBenchmarkBatch.models;
+    if (storedBenchmarkSummary?.models.length) return storedBenchmarkSummary.models;
+    return [];
+  }, [activeBenchmarkBatch, storedBenchmarkSummary]);
+  const benchmarkResults = useMemo(() => {
+    if (activeBenchmarkScopeModels.length === 0) return allFinishedBenchmarkResults;
+
+    return activeBenchmarkScopeModels
+      .map((model) => {
+        const result = mergedBenchmarkByModel[model];
+        return result && (result.status === "success" || result.status === "error") ? result : null;
+      })
+      .filter((item): item is FinishedModelBenchmarkResult => Boolean(item))
+      .sort((left, right) => {
+        const leftCurrent = benchmarkDialogItem?.model === left.model;
+        const rightCurrent = benchmarkDialogItem?.model === right.model;
+        if (leftCurrent !== rightCurrent) return leftCurrent ? -1 : 1;
+        return new Date(right.testedAt).getTime() - new Date(left.testedAt).getTime();
+      });
+  }, [activeBenchmarkScopeModels, allFinishedBenchmarkResults, benchmarkDialogItem?.model, mergedBenchmarkByModel]);
+  const activeBenchmarkSummary = useMemo(() => {
+    if (!benchmarkDialogItem) return null;
+    if (activeBenchmarkBatch) {
+      return buildBenchmarkSummary(
+        benchmarkDialogItem.id,
+        benchmarkResults,
+        activeBenchmarkBatch.rounds,
+        activeBenchmarkBatch.models
+      );
+    }
+    return storedBenchmarkSummary;
+  }, [activeBenchmarkBatch, benchmarkDialogItem, benchmarkResults, storedBenchmarkSummary]);
+  const failedBenchmarkResults = useMemo(
+    () => benchmarkResults.filter((item) => item.status === "error"),
+    [benchmarkResults]
+  );
+  const chartReadyBenchmarkResults = useMemo(
+    () => benchmarkResults.filter((item) => item.speed && item.status === "success"),
+    [benchmarkResults]
+  );
+  const activeBenchmarkChartResult = useMemo(
+    () => chartReadyBenchmarkResults.find((item) => item.model === benchmarkChartModel) || chartReadyBenchmarkResults[0] || null,
+    [benchmarkChartModel, chartReadyBenchmarkResults]
+  );
+  const activeBenchmarkDetailResult = useMemo(
+    () => benchmarkResults.find((item) => item.model === benchmarkDetailModel) || null,
+    [benchmarkDetailModel, benchmarkResults]
+  );
+  const benchmarkComparisonChartOption = useMemo<EChartsOption | null>(() => {
+    if (chartReadyBenchmarkResults.length === 0) return null;
+
+    const sortedResults = [...chartReadyBenchmarkResults].sort(
+      (left, right) => (left.speed?.avgMs || Number.POSITIVE_INFINITY) - (right.speed?.avgMs || Number.POSITIVE_INFINITY)
+    );
+
+    return {
+      animationDuration: 260,
+      grid: {
+        left: 18,
+        right: 18,
+        top: 20,
+        bottom: 10,
+        containLabel: true
+      },
+      legend: {
+        top: 0,
+        textStyle: {
+          color: "#334155",
+          fontSize: 11
+        }
+      },
+      tooltip: {
+        trigger: "axis",
+        axisPointer: {
+          type: "shadow"
+        },
+        valueFormatter: (value) => formatDurationLabel(typeof value === "number" ? value : undefined)
+      },
+      xAxis: {
+        type: "value",
+        axisLabel: {
+          color: "#64748b",
+          formatter: (value: number) => formatDurationLabel(value)
+        },
+        splitLine: {
+          lineStyle: {
+            color: "#e2e8f0"
+          }
+        }
+      },
+      yAxis: {
+        type: "category",
+        axisLabel: {
+          color: "#0f172a",
+          width: 180,
+          overflow: "truncate"
+        },
+        data: sortedResults.map((item) => item.model)
+      },
+      series: [
+        {
+          name: "平均耗时",
+          type: "bar",
+          barMaxWidth: 14,
+          itemStyle: {
+            color: "#16a34a",
+            borderRadius: [0, 8, 8, 0]
+          },
+          data: sortedResults.map((item) => item.speed?.avgMs || 0)
+        },
+        {
+          name: "中位耗时",
+          type: "bar",
+          barMaxWidth: 14,
+          itemStyle: {
+            color: "#0f172a",
+            borderRadius: [0, 8, 8, 0]
+          },
+          data: sortedResults.map((item) => item.speed?.medianMs || 0)
+        }
+      ]
+    };
+  }, [chartReadyBenchmarkResults]);
+  const benchmarkRoundChartOption = useMemo<EChartsOption | null>(() => {
+    if (!activeBenchmarkChartResult?.speed) return null;
+
+    const roundDetails = getBenchmarkRoundDetails(activeBenchmarkChartResult);
+    const elapsedValues = roundDetails.map((item) => item.elapsedMs ?? null);
+    const firstTokenValues = roundDetails.map((item) => item.firstTokenMs ?? null);
+
+    return {
+      animationDuration: 260,
+      grid: {
+        left: 20,
+        right: 20,
+        top: 24,
+        bottom: 18,
+        containLabel: true
+      },
+      tooltip: {
+        trigger: "axis",
+        valueFormatter: (value) => formatDurationLabel(typeof value === "number" ? value : undefined)
+      },
+      legend: {
+        top: 0,
+        textStyle: {
+          color: "#334155",
+          fontSize: 11
+        }
+      },
+      xAxis: {
+        type: "category",
+        axisLabel: {
+          color: "#64748b"
+        },
+        data: roundDetails.map((item) => `第${item.round}轮`)
+      },
+      yAxis: {
+        type: "value",
+        axisLabel: {
+          color: "#64748b",
+          formatter: (value: number) => formatDurationLabel(value)
+        },
+        splitLine: {
+          lineStyle: {
+            color: "#e2e8f0"
+          }
+        }
+      },
+      series: [
+        {
+          name: "总耗时",
+          type: "bar",
+          barMaxWidth: 26,
+          itemStyle: {
+            color: "#0f172a",
+            borderRadius: [8, 8, 0, 0]
+          },
+          markLine: {
+            symbol: "none",
+            label: {
+              color: "#0f172a",
+              formatter: ({ name, value }) => `${name} ${formatDurationLabel(typeof value === "number" ? value : undefined)}`
+            },
+            lineStyle: {
+              type: "dashed",
+              color: "#16a34a"
+            },
+            data: [
+              { name: "平均", yAxis: activeBenchmarkChartResult.speed.avgMs },
+              { name: "中位", yAxis: activeBenchmarkChartResult.speed.medianMs }
+            ]
+          },
+          data: elapsedValues
+        },
+        {
+          name: "首字时间",
+          type: "line",
+          smooth: true,
+          connectNulls: false,
+          itemStyle: {
+            color: "#f59e0b"
+          },
+          lineStyle: {
+            width: 2,
+            color: "#f59e0b"
+          },
+          data: firstTokenValues
+        }
+      ]
+    };
+  }, [activeBenchmarkChartResult]);
+
+  useEffect(() => {
+    if (!benchmarkDialogItem) return;
+
+    const nextModel =
+      chartReadyBenchmarkResults.find((item) => item.model === benchmarkChartModel)?.model ||
+      activeBenchmarkSummary?.recommendedModel ||
+      activeBenchmarkSummary?.fastestModel ||
+      chartReadyBenchmarkResults[0]?.model ||
+      "";
+
+    if (nextModel !== benchmarkChartModel) {
+      setBenchmarkChartModel(nextModel);
+    }
+  }, [activeBenchmarkSummary, benchmarkChartModel, benchmarkDialogItem, chartReadyBenchmarkResults]);
+
+  useEffect(() => {
+    const hasOverlayOpen = Boolean(benchmarkDialogItem || probeDialogItem || ccSwitchDialogItem);
+    if (!hasOverlayOpen) return;
+
+    const body = document.body;
+    const html = document.documentElement;
+    const previousBodyOverflow = body.style.overflow;
+    const previousBodyPaddingRight = body.style.paddingRight;
+    const previousHtmlOverflow = html.style.overflow;
+    const scrollbarWidth = Math.max(0, window.innerWidth - html.clientWidth);
+
+    body.style.overflow = "hidden";
+    html.style.overflow = "hidden";
+    if (scrollbarWidth > 0) {
+      body.style.paddingRight = `${scrollbarWidth}px`;
+    }
+
+    return () => {
+      body.style.overflow = previousBodyOverflow;
+      body.style.paddingRight = previousBodyPaddingRight;
+      html.style.overflow = previousHtmlOverflow;
+    };
+  }, [benchmarkDialogItem, ccSwitchDialogItem, probeDialogItem]);
 
   function ExportMenu({
     onExport,
@@ -1036,6 +2084,11 @@ export default function Home() {
       delete next[id];
       return next;
     });
+    setBenchmarkMap((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
     if (editingModelId === id) {
       setEditingModelId(null);
       setModelDraft("");
@@ -1045,6 +2098,9 @@ export default function Home() {
     }
     if (probeDialogId === id) {
       setProbeDialogId(null);
+    }
+    if (benchmarkDialogId === id) {
+      setBenchmarkDialogId(null);
     }
     setNotice("已删除");
   }
@@ -1061,6 +2117,7 @@ export default function Home() {
     setConfigs([]);
     setResultMap({});
     setProbeMap({});
+    setBenchmarkMap({});
     setLoadingMap({});
     setEditingId(null);
     setEditingModelId(null);
@@ -1068,6 +2125,7 @@ export default function Home() {
     setFormSourceMeta(undefined);
     setCcSwitchDialogId(null);
     setProbeDialogId(null);
+    setBenchmarkDialogId(null);
     setNotice("已删除全部配置");
   }
 
@@ -1087,8 +2145,71 @@ export default function Home() {
               model: !item.model && result.recommendedModel ? result.recommendedModel : item.model
             }
           : item
+        )
+    );
+  }
+
+  function commitFinishedBenchmarkResult(id: string, model: string, result: FinishedModelBenchmarkResult) {
+    setBenchmarkMap((prev) => ({
+      ...prev,
+      [id]: {
+        ...(prev[id] || {}),
+        [model]: result
+      }
+    }));
+    setConfigs((prev) =>
+      prev.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              benchmarks: {
+                ...(item.benchmarks || {}),
+                [model]: result
+              }
+            }
+          : item
       )
     );
+  }
+
+  function setPendingBenchmarkResult(id: string, model: string, tags: string[]) {
+    setBenchmarkMap((prev) => ({
+      ...prev,
+      [id]: {
+        ...(prev[id] || {}),
+        [model]: {
+          ...(prev[id]?.[model] || defaultModelBenchmarkResult(model)),
+          status: "pending",
+          model,
+          tags,
+          detail: "测试中..."
+        }
+      }
+    }));
+  }
+
+  function setPendingBenchmarkResults(id: string, models: string[]) {
+    const uniqueModels = uniqueStrings(models);
+    if (uniqueModels.length === 0) return;
+
+    setBenchmarkMap((prev) => ({
+      ...prev,
+      [id]: {
+        ...(prev[id] || {}),
+        ...Object.fromEntries(
+          uniqueModels.map((model) => [
+            model,
+            {
+              ...(prev[id]?.[model] || defaultModelBenchmarkResult(model)),
+              status: "pending" as const,
+              model,
+              tags: inferModelTags(model),
+              detail: "测试中..."
+            }
+          ])
+        )
+      }
+    }));
   }
 
   async function runTest(item: KeyConfig): Promise<boolean> {
@@ -1111,35 +2232,13 @@ export default function Home() {
 
     try {
       const client = makeOpenAIClient(baseUrl, apiKey);
+      const response = await requestModelText(client, item.model || "gpt-4o-mini", "你好，请回复：ok", 16);
 
-      const response = await client.chat.completions.create({
-        model: item.model || "gpt-4o-mini",
-        messages: [{ role: "user", content: "你好，请回复：ok" }],
-        max_tokens: 16
-      });
-
-      // Some relay gateways return { error: {...} } with HTTP 200.
-      const responseHasError = isRecord(response) && "error" in response;
-      if (responseHasError) {
-        const responseError = getErrorMessage(response) || "模型不可用或上游渠道异常";
-        commitFinishedTestResult(item.id, {
-          status: "error",
-          message: FAIL_TEXT,
-          detail: `接口返回：${responseError}`,
-          testedAt: new Date().toISOString()
-        });
-        return false;
-      }
-
-      const content = response.choices[0]?.message?.content;
-      const readableText = toReadableResponseText(content);
-      const hasMessage = Boolean(readableText || content);
-
-      if (hasMessage) {
+      if (response.ok) {
         commitFinishedTestResult(item.id, {
           status: "success",
           message: PASS_TEXT,
-          detail: readableText ? `接口返回：${readableText}` : "返回消息正常",
+          detail: response.text ? `接口返回：${response.text}` : "返回消息正常",
           testedAt: new Date().toISOString()
         });
         return true;
@@ -1148,15 +2247,7 @@ export default function Home() {
       commitFinishedTestResult(item.id, {
         status: "error",
         message: FAIL_TEXT,
-        detail: "未返回消息内容",
-        testedAt: new Date().toISOString()
-      });
-      return false;
-    } catch (error: unknown) {
-      commitFinishedTestResult(item.id, {
-        status: "error",
-        message: FAIL_TEXT,
-        detail: makeErrorDetail(error),
+        detail: response.error || "未返回消息内容",
         testedAt: new Date().toISOString()
       });
       return false;
@@ -1226,25 +2317,12 @@ export default function Home() {
       let fallbackError = "";
 
       for (const candidate of MODEL_CANDIDATES) {
-        try {
-          const response = await client.chat.completions.create({
-            model: candidate,
-            messages: [{ role: "user", content: "你好，请回复：ok" }],
-            max_tokens: 12
-          });
-
-          const responseHasError = isRecord(response) && "error" in response;
-          if (responseHasError) {
-            fallbackError = getErrorMessage(response) || fallbackError;
-            continue;
-          }
-
-          const content = response.choices[0]?.message?.content;
-          const readableText = toReadableResponseText(content);
-          if (readableText || content) supportedModels.push(candidate);
-        } catch (error: unknown) {
-          if (!fallbackError) fallbackError = makeErrorDetail(error);
+        const response = await requestModelText(client, candidate, "你好，请回复：ok", 12);
+        if (response.ok) {
+          supportedModels.push(candidate);
+          continue;
         }
+        if (!fallbackError && response.error) fallbackError = response.error;
       }
 
       if (supportedModels.length > 0) {
@@ -1274,6 +2352,238 @@ export default function Home() {
       });
       return false;
     }
+  }
+
+  async function runModelBenchmark(
+    item: KeyConfig,
+    model: string,
+    rounds: number,
+    onRoundStart?: (modelName: string, roundIndex: number) => void
+  ): Promise<FinishedModelBenchmarkResult | null> {
+    const baseUrl = toOpenAIBaseUrl(item.baseUrl);
+    const apiKey = cleanKey(item.apiKey);
+    const tags = inferModelTags(model);
+
+    setPendingBenchmarkResult(item.id, model, tags);
+
+    if (!baseUrl || !apiKey) {
+      commitFinishedBenchmarkResult(item.id, model, {
+        status: "error",
+        model,
+        tags,
+        detail: "地址或 Key 为空，无法执行模型测试",
+        testedAt: new Date().toISOString()
+      });
+      return null;
+    }
+
+    const client = makeOpenAIClient(baseUrl, apiKey);
+    const elapsedSamples: number[] = [];
+    const firstTokenSamples: number[] = [];
+    const speedErrors: string[] = [];
+    const roundDetails: BenchmarkRoundDetail[] = [];
+
+    for (let round = 0; round < rounds; round += 1) {
+      onRoundStart?.(model, round + 1);
+      const streamedResponse = await requestModelTextStream(
+        baseUrl,
+        apiKey,
+        model,
+        "Reply with exactly OK. Do not add anything else.",
+        8
+      );
+
+      if (streamedResponse.ok) {
+        elapsedSamples.push(streamedResponse.elapsedMs);
+        if (typeof streamedResponse.firstTokenMs === "number") {
+          firstTokenSamples.push(streamedResponse.firstTokenMs);
+        }
+        roundDetails.push({
+          round: round + 1,
+          ok: true,
+          elapsedMs: streamedResponse.elapsedMs,
+          firstTokenMs: streamedResponse.firstTokenMs
+        });
+        continue;
+      }
+
+      const fallbackResponse = await requestModelText(client, model, "Reply with exactly OK. Do not add anything else.", 8);
+      if (fallbackResponse.ok) {
+        elapsedSamples.push(fallbackResponse.elapsedMs);
+        roundDetails.push({
+          round: round + 1,
+          ok: true,
+          elapsedMs: fallbackResponse.elapsedMs
+        });
+      } else if (fallbackResponse.error) {
+        speedErrors.push(fallbackResponse.error);
+        roundDetails.push({
+          round: round + 1,
+          ok: false,
+          error: fallbackResponse.error
+        });
+      } else if (streamedResponse.error) {
+        speedErrors.push(streamedResponse.error);
+        roundDetails.push({
+          round: round + 1,
+          ok: false,
+          error: streamedResponse.error
+        });
+      } else {
+        roundDetails.push({
+          round: round + 1,
+          ok: false,
+          error: "测速失败，未返回可读内容"
+        });
+      }
+    }
+
+    if (elapsedSamples.length === 0) {
+      commitFinishedBenchmarkResult(item.id, model, {
+        status: "error",
+        model,
+        tags,
+        speed: {
+          rounds,
+          medianMs: 0,
+          avgMs: 0,
+          successRate: 0,
+          stabilityMs: 0,
+          samplesMs: [],
+          roundDetails
+        },
+        detail: uniqueStrings(speedErrors)[0] || "测速失败，模型未返回可读内容",
+        testedAt: new Date().toISOString()
+      });
+      return null;
+    }
+
+    const medianMs = medianOf(elapsedSamples);
+    const avgMs = averageOf(elapsedSamples);
+    const firstTokenMedianMs = firstTokenSamples.length > 0 ? medianOf(firstTokenSamples) : undefined;
+    const firstTokenAvgMs = firstTokenSamples.length > 0 ? averageOf(firstTokenSamples) : undefined;
+    const successRate = elapsedSamples.length / rounds;
+    const stabilityMs = computeStability(elapsedSamples);
+    const detailParts = [
+      `成功 ${elapsedSamples.length}/${rounds}`,
+      firstTokenMedianMs ? `首字中位 ${formatDurationLabel(firstTokenMedianMs)}` : "",
+      `中位耗时 ${formatDurationLabel(medianMs)}`,
+      `波动 ${formatDurationLabel(stabilityMs)}`,
+      speedErrors.length > 0 ? `异常：${uniqueStrings(speedErrors)[0]}` : "",
+    ].filter(Boolean);
+
+    const result: FinishedModelBenchmarkResult = {
+      status: "success",
+      model,
+      tags,
+      speed: {
+        rounds,
+        medianMs,
+        avgMs,
+        successRate,
+        stabilityMs,
+        samplesMs: elapsedSamples,
+        firstTokenMedianMs,
+        firstTokenAvgMs,
+        firstTokenSamplesMs: firstTokenSamples.length > 0 ? firstTokenSamples : undefined,
+        roundDetails
+      },
+      detail: detailParts.join("；"),
+      testedAt: new Date().toISOString()
+    };
+    commitFinishedBenchmarkResult(item.id, model, result);
+    return result;
+  }
+
+  async function benchmarkModels(item: KeyConfig, models: string[], rounds: number) {
+    const uniqueModels = uniqueStrings(models);
+    const benchmarkableModels = uniqueModels.filter((model) => isLikelyChatBenchmarkable(model));
+    const skipped = uniqueModels.length - benchmarkableModels.length;
+
+    if (benchmarkableModels.length === 0) {
+      setNotice(skipped > 0 ? `已跳过 ${skipped} 个非对话模型` : "没有可测试的模型");
+      return;
+    }
+
+    setPendingBenchmarkResults(item.id, benchmarkableModels);
+    setBenchmarkBatch({
+      configId: item.id,
+      models: benchmarkableModels,
+      rounds,
+      done: 0,
+      total: benchmarkableModels.length,
+      skipped,
+      currentModel: benchmarkableModels[0],
+      currentRound: 1
+    });
+    setBenchmarkListCollapsed(true);
+
+    let okCount = 0;
+    const successfulBenchmarks: FinishedModelBenchmarkResult[] = [];
+    for (let index = 0; index < benchmarkableModels.length; index += 1) {
+      const model = benchmarkableModels[index];
+      setBenchmarkBatch((prev) =>
+        prev && prev.configId === item.id
+          ? {
+              ...prev,
+              currentModel: model,
+              currentRound: 1
+            }
+          : prev
+      );
+      const result = await runModelBenchmark(item, model, rounds, (modelName, roundIndex) => {
+        setBenchmarkBatch((prev) =>
+          prev && prev.configId === item.id
+            ? {
+                ...prev,
+                currentModel: modelName,
+                currentRound: roundIndex
+              }
+            : prev
+        );
+      });
+      if (result) {
+        okCount += 1;
+        successfulBenchmarks.push(result);
+      }
+
+      setBenchmarkBatch((prev) =>
+        prev && prev.configId === item.id
+          ? {
+              ...prev,
+              done: index + 1
+            }
+          : prev
+      );
+    }
+
+    const fastest = pickFastestBenchmark(successfulBenchmarks);
+    const quickestFirstToken = pickQuickestFirstTokenBenchmark(successfulBenchmarks);
+    const mostStable = pickMostStableBenchmark(successfulBenchmarks);
+    const recommended = pickRecommendedBenchmark(successfulBenchmarks);
+
+    setBenchmarkSummaryMap((prev) => ({
+      ...prev,
+      [item.id]: {
+        configId: item.id,
+        rounds,
+        models: uniqueStrings(benchmarkableModels),
+        totalModels: benchmarkableModels.length,
+        successModels: okCount,
+        fastestModel: fastest?.model,
+        fastestMedianMs: fastest?.speed?.medianMs,
+        quickestFirstTokenModel: quickestFirstToken?.model,
+        quickestFirstTokenMs: quickestFirstToken?.speed?.firstTokenMedianMs,
+        mostStableModel: mostStable?.model,
+        stabilityMs: mostStable?.speed?.stabilityMs,
+        recommendedModel: recommended?.model,
+        finishedAt: new Date().toISOString()
+      }
+    }));
+    setBenchmarkBatch(null);
+    setNotice(
+      `模型测试完成：成功 ${okCount}，失败 ${benchmarkableModels.length - okCount}${skipped > 0 ? `，跳过 ${skipped}` : ""}`
+    );
   }
 
   async function probeConfig(item: KeyConfig) {
@@ -1378,11 +2688,61 @@ export default function Home() {
   }
 
   function openProbeDialog(item: KeyConfig) {
+    setBenchmarkDialogId(null);
+    setBenchmarkBatch(null);
     setProbeDialogId(item.id);
+  }
+
+  function openBenchmarkDialog(item: KeyConfig) {
+    const activeProbe = probeMap[item.id] || item.probe || defaultProbeResult();
+    if (activeProbe.supportedModels.length === 0) {
+      setNotice("请先探测模型，再打开模型测试");
+      return;
+    }
+
+    setBenchmarkSearch("");
+    setBenchmarkRoundsInput(String(DEFAULT_BENCHMARK_ROUNDS));
+    const currentModel = item.model.trim();
+    if (currentModel && activeProbe.supportedModels.includes(currentModel) && isLikelyChatBenchmarkable(currentModel)) {
+      setSelectedProbeModels([currentModel]);
+    } else {
+      setSelectedProbeModels([]);
+    }
+
+    setProbeDialogId(null);
+    setBenchmarkChartModel(item.model.trim());
+    setBenchmarkListCollapsed(false);
+    setBenchmarkDialogId(item.id);
   }
 
   function closeProbeDialog() {
     setProbeDialogId(null);
+  }
+
+  function closeBenchmarkDialog() {
+    setBenchmarkSearch("");
+    setSelectedProbeModels([]);
+    setBenchmarkBatch(null);
+    setBenchmarkChartModel("");
+    setBenchmarkListCollapsed(false);
+    setBenchmarkDetailModel("");
+    setBenchmarkDialogId(null);
+  }
+
+  function toggleProbeModelSelection(model: string) {
+    setSelectedProbeModels((prev) => (prev.includes(model) ? prev.filter((item) => item !== model) : [...prev, model]));
+  }
+
+  function selectVisibleProbeModels() {
+    setSelectedProbeModels(visibleBenchmarkableModels);
+  }
+
+  function selectAllProbeModels() {
+    setSelectedProbeModels(probeDialogModels.filter((item) => item.benchmarkable).map((item) => item.model));
+  }
+
+  function clearSelectedProbeModels() {
+    setSelectedProbeModels([]);
   }
 
   async function copyProbeModels(item: KeyConfig, probe: ProbeResult | FinishedProbeResult) {
@@ -1455,6 +2815,7 @@ export default function Home() {
       ? original.baseUrl !== baseUrl || original.apiKey !== apiKey || (original.model || "") !== model
       : false;
     const resetProbe = original ? original.baseUrl !== baseUrl || original.apiKey !== apiKey : false;
+    const resetBenchmarks = resetProbe;
 
     setConfigs((prev) =>
       prev.map((item) =>
@@ -1466,7 +2827,8 @@ export default function Home() {
               apiKey,
               model,
               lastTest: resetLastTest ? undefined : item.lastTest,
-              probe: resetProbe ? undefined : item.probe
+              probe: resetProbe ? undefined : item.probe,
+              benchmarks: resetBenchmarks ? undefined : item.benchmarks
             }
           : item
       )
@@ -1480,6 +2842,13 @@ export default function Home() {
     }
     if (resetProbe) {
       setProbeMap((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }
+    if (resetBenchmarks) {
+      setBenchmarkMap((prev) => {
         const next = { ...prev };
         delete next[id];
         return next;
@@ -1539,7 +2908,7 @@ export default function Home() {
           />
           <span>AI Key Vault</span>
         </h1>
-        <p className="text-sm text-zinc-500">本地保存、批量测试、模型探测、复制与导出</p>
+        <p className="text-sm text-zinc-500">本地保存、批量测试、模型识别、性能评测、复制与导出</p>
       </header>
 
       <section className="rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 via-emerald-50/70 to-white p-3.5 shadow-sm">
@@ -1564,7 +2933,7 @@ export default function Home() {
         {introExpanded ? (
           <>
             <p className="mt-2 text-sm leading-6 text-emerald-800">
-              统一管理名称/地址/Key/模型，支持一键测试、模型探测和唤起 CC Switch，数据仅存浏览器本地。
+              统一管理名称/地址/Key/模型，支持一键测试、模型识别、性能评测和唤起 CC Switch，数据仅存浏览器本地。
             </p>
             <p className="mt-2 text-xs font-medium text-emerald-700/90">单条配置支持直接导出到 CC Switch。</p>
           </>
@@ -1652,7 +3021,7 @@ export default function Home() {
               </button>
               <button type="button" className={topBtnGhost} onClick={probeAllConfigs} disabled={probingAll}>
                 {probingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
-                <span>{probingAll ? "探测中" : "探测全部模型"}</span>
+                <span>{probingAll ? "识别中" : "识别全部模型"}</span>
               </button>
               <button
                 type="button"
@@ -1678,7 +3047,7 @@ export default function Home() {
           {configs.length === 0 ? (
             <p className="text-sm text-zinc-500">暂无配置</p>
           ) : (
-            <ul className="grid gap-3">
+            <ul className="grid gap-2.5">
               {configs.map((item) => {
                 const testing = loadingMap[item.id];
                 const result = resultMap[item.id] || item.lastTest || defaultTestResult();
@@ -1686,9 +3055,17 @@ export default function Home() {
                 const isEditing = editingId === item.id;
                 const isEditingModel = editingModelId === item.id;
                 const probing = probe.status === "pending";
+                const currentModelTags = inferModelTags(item.model);
+                const runtimeBenchmarks = benchmarkMap[item.id] || {};
+                const currentBenchmark =
+                  item.model.trim() ? runtimeBenchmarks[item.model] || item.benchmarks?.[item.model] || defaultModelBenchmarkResult(item.model) : null;
+                const finishedBenchmarks = collectFinishedBenchmarks(item, runtimeBenchmarks);
+                const fastestBenchmark = pickFastestBenchmark(finishedBenchmarks);
+                const quickestFirstTokenBenchmark = pickQuickestFirstTokenBenchmark(finishedBenchmarks);
+                const recommendedBenchmark = pickRecommendedBenchmark(finishedBenchmarks);
 
                 return (
-                  <li key={item.id} className="rounded-2xl border border-zinc-200 bg-white p-3">
+                  <li key={item.id} className="rounded-2xl border border-zinc-200 bg-white p-2.5">
                     {isEditing ? (
                       <div className="rounded-xl border border-dashed border-zinc-300 p-3">
                         <label className={labelClass}>名称</label>
@@ -1784,36 +3161,50 @@ export default function Home() {
                             <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
                               <FaTag aria-hidden /> 模型
                             </span>
-                            {isEditingModel ? (
-                              <input
-                                autoFocus
-                                className={inputClass}
-                                value={modelDraft}
-                                onChange={(e) => setModelDraft(e.target.value)}
-                                onBlur={() => saveInlineModelEdit(item.id)}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") {
-                                    e.preventDefault();
-                                    saveInlineModelEdit(item.id);
-                                  }
-                                  if (e.key === "Escape") {
-                                    e.preventDefault();
-                                    cancelInlineModelEdit();
-                                  }
-                                }}
-                                placeholder="点击后可修改"
-                              />
-                            ) : (
-                              <button
-                                type="button"
-                                className="inline-flex w-fit rounded-md border border-zinc-200 px-2 py-1 text-sm text-zinc-700 hover:bg-zinc-50"
-                                onClick={() => startInlineModelEdit(item)}
-                                title="点击编辑模型"
-                                aria-label="点击编辑模型"
-                              >
-                                {item.model || "点击设置模型"}
-                              </button>
-                            )}
+                            <div className="grid gap-1.5">
+                              {isEditingModel ? (
+                                <input
+                                  autoFocus
+                                  className={inputClass}
+                                  value={modelDraft}
+                                  onChange={(e) => setModelDraft(e.target.value)}
+                                  onBlur={() => saveInlineModelEdit(item.id)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                      e.preventDefault();
+                                      saveInlineModelEdit(item.id);
+                                    }
+                                    if (e.key === "Escape") {
+                                      e.preventDefault();
+                                      cancelInlineModelEdit();
+                                    }
+                                  }}
+                                  placeholder="点击后可修改"
+                                />
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="inline-flex w-fit rounded-md border border-zinc-200 px-2 py-1 text-sm text-zinc-700 hover:bg-zinc-50"
+                                  onClick={() => startInlineModelEdit(item)}
+                                  title="点击编辑模型"
+                                  aria-label="点击编辑模型"
+                                >
+                                  {item.model || "点击设置模型"}
+                                </button>
+                              )}
+                              {currentModelTags.length > 0 ? (
+                                <div className="flex flex-wrap gap-1.5">
+                                  {currentModelTags.map((tag) => (
+                                    <span
+                                      key={`${item.id}-${tag}`}
+                                      className={`rounded-full border px-2 py-0.5 text-[11px] font-medium uppercase tracking-[0.08em] ${getTagClassName(tag)}`}
+                                    >
+                                      {tag}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </div>
                           </div>
 
                           <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
@@ -1846,7 +3237,8 @@ export default function Home() {
 
                           <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
                             <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
-                              <FaMagic aria-hidden /> 探测
+                              <FaMagic aria-hidden /> 模型识别
+                              <HelpHint text="读取这组地址和 Key 可见的模型列表，帮助你先知道有哪些模型可以选。" />
                             </span>
                             <div className="grid gap-1">
                               <span
@@ -1855,12 +3247,12 @@ export default function Home() {
                                 <StatusIcon status={probe.status} />
                                 <span>
                                   {probe.status === "idle"
-                                    ? "未探测"
+                                    ? "未识别"
                                     : probe.status === "pending"
-                                      ? "探测中..."
+                                      ? "识别中..."
                                       : probe.status === "success"
-                                        ? "探测成功"
-                                        : "探测失败"}
+                                        ? "识别成功"
+                                        : "识别失败"}
                                 </span>
                               </span>
                               {probe.recommendedModel ? (
@@ -1878,7 +3270,53 @@ export default function Home() {
                               ) : null}
                               {probe.detail ? <span className="text-xs text-zinc-500">{probe.detail}</span> : null}
                               {probe.testedAt ? (
-                                <span className="text-xs text-zinc-500">最近探测：{toDateTimeLabel(probe.testedAt)}</span>
+                                <span className="text-xs text-zinc-500">最近识别：{toDateTimeLabel(probe.testedAt)}</span>
+                              ) : null}
+                            </div>
+                          </div>
+
+                          <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                            <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                              <FaBolt aria-hidden /> 性能评测
+                              <HelpHint text="对已识别到的模型做响应速度测试，帮你挑一个更适合日常使用的默认模型。" />
+                            </span>
+                            <div className="grid min-w-0 gap-1.5">
+                              <span
+                                className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${
+                                  currentBenchmark ? statusPillClass(currentBenchmark.status) : statusPillClass("idle")
+                                }`}
+                              >
+                                <StatusIcon status={currentBenchmark?.status || "idle"} />
+                                <span>{currentBenchmark ? benchmarkStatusLabel(currentBenchmark) : "未测试"}</span>
+                              </span>
+                              {currentBenchmark?.speed?.medianMs ? (
+                                <span className="break-all text-xs leading-5 text-zinc-600">
+                                  当前中位：{formatDurationLabel(currentBenchmark.speed.medianMs)}
+                                </span>
+                              ) : null}
+                              {currentBenchmark?.speed?.firstTokenMedianMs ? (
+                                <span className="break-all text-xs leading-5 text-zinc-600">
+                                  当前首字：{formatDurationLabel(currentBenchmark.speed.firstTokenMedianMs)}
+                                </span>
+                              ) : null}
+                              {finishedBenchmarks.length > 0 ? (
+                                <span className="break-all text-xs leading-5 text-zinc-500">已测：{finishedBenchmarks.length} 个模型</span>
+                              ) : null}
+                              {fastestBenchmark?.speed?.medianMs ? (
+                                <span className="break-all text-xs leading-5 text-zinc-500">
+                                  最快：{fastestBenchmark.model} · {formatDurationLabel(fastestBenchmark.speed.medianMs)}
+                                </span>
+                              ) : null}
+                              {quickestFirstTokenBenchmark?.speed?.firstTokenMedianMs ? (
+                                <span className="break-all text-xs leading-5 text-zinc-500">
+                                  首字最快：{quickestFirstTokenBenchmark.model} ·{" "}
+                                  {formatDurationLabel(quickestFirstTokenBenchmark.speed.firstTokenMedianMs)}
+                                </span>
+                              ) : null}
+                              {recommendedBenchmark ? (
+                                <span className="break-all text-xs leading-5 text-zinc-500">
+                                  推荐默认：{recommendedBenchmark.model}
+                                </span>
                               ) : null}
                             </div>
                           </div>
@@ -1902,11 +3340,22 @@ export default function Home() {
                               className={smallBtn}
                               onClick={() => probeConfig(item)}
                               disabled={probing}
-                              title="探测模型"
-                              aria-label="探测模型"
+                              title="识别模型"
+                              aria-label="识别模型"
                             >
                               {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
-                              <span>探测</span>
+                              <span>识别模型</span>
+                            </button>
+                            <button
+                              type="button"
+                              className={smallBtn}
+                              onClick={() => openBenchmarkDialog(item)}
+                              disabled={probe.supportedModels.length === 0}
+                              title={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
+                              aria-label={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
+                            >
+                              <FaVial aria-hidden />
+                              <span>性能评测</span>
                             </button>
                           </div>
 
@@ -2014,133 +3463,710 @@ export default function Home() {
 
       {probeDialogItem ? (
         <div className="fixed inset-0 z-30 flex items-center justify-center bg-zinc-950/35 px-4">
-          <div className="w-full max-w-4xl rounded-3xl border border-zinc-200 bg-white p-4 shadow-2xl sm:p-5">
+          <div className="w-full max-w-4xl rounded-[30px] border border-zinc-200 bg-white p-4 shadow-2xl sm:p-5">
             {(() => {
               const activeProbe = probeMap[probeDialogItem.id] || probeDialogItem.probe || defaultProbeResult();
               const currentModel = probeDialogItem.model || "";
 
               return (
                 <>
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p className="text-base font-semibold text-zinc-900">模型探测结果</p>
-                <p className="mt-1 text-sm text-zinc-500">
-                  {probeDialogItem.name}
-                  {activeProbe.testedAt ? ` · ${toDateTimeLabel(activeProbe.testedAt)}` : ""}
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  className={btnGhost}
-                  onClick={() => copyProbeModels(probeDialogItem, activeProbe)}
-                >
-                  <FaCopy aria-hidden />
-                  <span>复制模型列表</span>
-                </button>
-                <button type="button" className={smallBtn} onClick={closeProbeDialog}>
-                  <FaTimesCircle aria-hidden />
-                  <span>关闭</span>
-                </button>
-              </div>
-            </div>
-
-            <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1.2fr)_minmax(16rem,0.8fr)]">
-              <div className="rounded-2xl border border-zinc-200 bg-zinc-50 p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span
-                    className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${statusPillClass(activeProbe.status)}`}
-                  >
-                    <StatusIcon status={activeProbe.status} />
-                    <span>
-                      {activeProbe.status === "success"
-                        ? "探测成功"
-                        : activeProbe.status === "pending"
-                          ? "探测中..."
-                          : activeProbe.status === "error"
-                            ? "探测失败"
-                            : "未探测"}
-                    </span>
-                  </span>
-                  <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-zinc-600 ring-1 ring-zinc-200">
-                    共 {activeProbe.supportedModels.length} 个模型
-                  </span>
-                </div>
-                <div className="mt-3 text-sm text-zinc-600">
-                  {activeProbe.detail || "暂无探测详情"}
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-3">
-                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-emerald-600">当前模型</p>
-                <p className="mt-2 break-all text-lg font-bold text-emerald-900">{currentModel || "未设置"}</p>
-                <p className="mt-2 text-sm text-emerald-800">可在下方列表直接复制或切换</p>
-              </div>
-            </div>
-
-            <div className="mt-4 rounded-2xl border border-zinc-200 bg-white p-3">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <p className="text-sm font-semibold text-zinc-900">已识别模型</p>
-                <p className="text-xs text-zinc-500">每项支持复制和一键设为当前模型</p>
-              </div>
-              {activeProbe.supportedModels.length > 0 ? (
-                <div className="grid max-h-[45vh] grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
-                  {activeProbe.supportedModels.map((model) => {
-                    const isCurrent = currentModel === model;
-
-                    return (
-                    <div
-                      key={model}
-                      className={`flex items-start justify-between gap-2 rounded-xl border px-3 py-2.5 ${
-                        isCurrent ? "border-emerald-300 bg-emerald-50/70" : "border-zinc-200 bg-zinc-50"
-                      }`}
-                    >
-                      <div className="min-w-0">
-                        <p className="break-all text-sm font-medium text-zinc-800">{model}</p>
-                        <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                          {isCurrent ? (
-                            <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
-                              当前
-                            </span>
-                          ) : null}
-                        </div>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-1">
-                        <button
-                          type="button"
-                          className={modalIconBtn}
-                          onClick={() => copySingleProbeModel(model)}
-                          title={`复制 ${model}`}
-                          aria-label={`复制 ${model}`}
-                        >
-                          <FaCopy aria-hidden />
-                        </button>
-                        <button
-                          type="button"
-                          className={`${modalIconBtn} ${
-                            isCurrent
-                              ? "border-emerald-200 bg-emerald-100 text-emerald-700 hover:border-emerald-200 hover:bg-emerald-100 hover:text-emerald-700"
-                              : ""
-                          }`}
-                          onClick={() => applyProbeModel(probeDialogItem.id, model)}
-                          disabled={isCurrent}
-                          title={isCurrent ? `${model} 已是当前模型` : `切换到 ${model}`}
-                          aria-label={isCurrent ? `${model} 已是当前模型` : `切换到 ${model}`}
-                        >
-                          <FaExchangeAlt aria-hidden />
-                        </button>
-                      </div>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="inline-flex items-center gap-2 text-base font-semibold text-zinc-900">
+                        <span>模型识别结果</span>
+                        <HelpHint text="读取当前配置可见的模型列表。这里只负责看有哪些模型，真正的速度对比在性能评测里。"/>
+                      </p>
+                      <p className="mt-1 text-sm text-zinc-500">
+                        {probeDialogItem.name}
+                        {activeProbe.testedAt ? ` · ${toDateTimeLabel(activeProbe.testedAt)}` : ""}
+                      </p>
                     </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <p className="text-sm text-zinc-500">暂无可展示的模型列表</p>
-              )}
-            </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button type="button" className={btnGhost} onClick={() => copyProbeModels(probeDialogItem, activeProbe)}>
+                        <FaCopy aria-hidden />
+                        <span>复制模型列表</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={btnPrimary}
+                        onClick={() => openBenchmarkDialog(probeDialogItem)}
+                        disabled={activeProbe.supportedModels.length === 0}
+                      >
+                        <FaVial aria-hidden />
+                        <span>打开性能评测</span>
+                      </button>
+                      <button type="button" className={smallBtn} onClick={closeProbeDialog}>
+                        <FaTimesCircle aria-hidden />
+                        <span>关闭</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1.15fr)_minmax(15rem,0.85fr)]">
+                    <div className="rounded-2xl border border-zinc-200 bg-zinc-50 p-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${statusPillClass(
+                            activeProbe.status
+                          )}`}
+                        >
+                          <StatusIcon status={activeProbe.status} />
+                          <span>
+                                  {activeProbe.status === "success"
+                              ? "识别成功"
+                              : activeProbe.status === "pending"
+                                ? "识别中..."
+                                : activeProbe.status === "error"
+                                  ? "识别失败"
+                                  : "未识别"}
+                          </span>
+                        </span>
+                        <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-zinc-600 ring-1 ring-zinc-200">
+                          共 {activeProbe.supportedModels.length} 个模型
+                        </span>
+                      </div>
+                      <div className="mt-3 text-sm leading-6 text-zinc-600">{activeProbe.detail || "暂无识别详情"}</div>
+                    </div>
+
+                    <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-3">
+                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-emerald-600">当前模型</p>
+                      <p className="mt-2 break-all text-lg font-bold text-emerald-900">{currentModel || "未设置"}</p>
+                      <p className="mt-2 text-sm text-emerald-800">这里只保留复制与切换，性能评测放到独立窗口里做。</p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-2xl border border-zinc-200 bg-white p-3">
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                      <p className="text-sm font-semibold text-zinc-900">已识别模型</p>
+                      <p className="text-xs text-zinc-500">轻量展示，避免和测试工作台混在一起</p>
+                    </div>
+                    {activeProbe.supportedModels.length > 0 ? (
+                      <div className="grid max-h-[45vh] grid-cols-1 items-start gap-2 overflow-y-auto pr-1 sm:grid-cols-2 xl:grid-cols-4">
+                        {activeProbe.supportedModels.map((model) => {
+                          const isCurrent = currentModel === model;
+                          const tags = inferModelTags(model);
+
+                          return (
+                            <div
+                              key={model}
+                              className={`self-start rounded-xl border px-3 py-2.5 ${
+                                isCurrent ? "border-emerald-300 bg-emerald-50/70" : "border-zinc-200 bg-zinc-50"
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <p className="break-all text-[13px] font-semibold leading-5 text-zinc-900">{model}</p>
+                                  {tags.length > 0 ? (
+                                    <div className="mt-1.5 flex flex-wrap gap-1">
+                                      {tags.map((tag) => (
+                                        <span
+                                          key={`${model}-${tag}`}
+                                          className={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] ${getTagClassName(tag)}`}
+                                        >
+                                          {tag}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  ) : null}
+                                </div>
+                                {isCurrent ? (
+                                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">当前</span>
+                                ) : null}
+                              </div>
+
+                              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-white text-[11px] text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-45"
+                                  onClick={() => copySingleProbeModel(model)}
+                                  title={`复制 ${model}`}
+                                  aria-label={`复制 ${model}`}
+                                >
+                                  <FaCopy aria-hidden />
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-[11px] transition disabled:cursor-not-allowed disabled:opacity-45 ${
+                                    isCurrent
+                                      ? "border-emerald-200 bg-emerald-100 text-emerald-700 hover:border-emerald-200 hover:bg-emerald-100 hover:text-emerald-700"
+                                      : "border-zinc-200 bg-white text-zinc-500 hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900"
+                                  }`}
+                                  onClick={() => applyProbeModel(probeDialogItem.id, model)}
+                                  disabled={isCurrent}
+                                  title={isCurrent ? `${model} 已是当前模型` : `切换到 ${model}`}
+                                  aria-label={isCurrent ? `${model} 已是当前模型` : `切换到 ${model}`}
+                                >
+                                  <FaExchangeAlt aria-hidden />
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p className="text-sm text-zinc-500">暂无可展示的模型列表</p>
+                    )}
+                  </div>
                 </>
               );
             })()}
+          </div>
+        </div>
+      ) : null}
+
+      {benchmarkDialogItem ? (
+        <div className="fixed inset-0 z-30 overflow-hidden bg-zinc-950/40 px-3 py-4 sm:px-4 sm:py-8">
+          <div className="flex min-h-full items-start justify-center">
+            <div className="flex max-h-[calc(100vh-32px)] w-full max-w-6xl flex-col overflow-hidden rounded-[28px] border border-zinc-200 bg-white shadow-2xl sm:max-h-[calc(100vh-64px)]">
+              <div className="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 px-4 py-4 sm:px-5">
+                <div>
+                  <p className="inline-flex items-center gap-2 text-base font-semibold text-zinc-900">
+                    <span>性能评测</span>
+                    <HelpHint text="对已识别到的模型做响应速度测试，方便你比较哪个模型更快、更稳，适合设为默认模型。" />
+                  </p>
+                  <p className="mt-1 text-sm text-zinc-500">
+                    {benchmarkDialogItem.name} · 已识别 {probeDialogModels.length} 个模型
+                    {activeProbeDialogProbe.testedAt ? ` · 最近识别：${toDateTimeLabel(activeProbeDialogProbe.testedAt)}` : ""}
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button type="button" className={btnGhost} onClick={() => copyProbeModels(benchmarkDialogItem, activeProbeDialogProbe)}>
+                    <FaCopy aria-hidden />
+                    <span>复制模型列表</span>
+                  </button>
+                  <button type="button" className={smallBtn} onClick={closeBenchmarkDialog}>
+                    <FaTimesCircle aria-hidden />
+                    <span>关闭</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="border-b border-zinc-200 bg-zinc-50/80 px-4 py-3 sm:px-5">
+                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-end">
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">搜索模型</span>
+                    <input
+                      className={inputClass}
+                      value={benchmarkSearch}
+                      onChange={(e) => setBenchmarkSearch(e.target.value)}
+                      placeholder="输入模型名或 tag，例如 gpt / thinking / embedding"
+                    />
+                  </label>
+
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-3 py-2.5">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-emerald-700">测试次数</p>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      {[1, 2, 3].map((round) => {
+                        const active = benchmarkRounds === round;
+                        return (
+                          <button
+                            key={round}
+                            type="button"
+                            className={
+                              active
+                                ? "rounded-full border border-emerald-700 bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white"
+                                : "rounded-full border border-emerald-200 bg-white px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
+                            }
+                            onClick={() => setBenchmarkRoundsInput(String(round))}
+                          >
+                            {round}次
+                          </button>
+                        );
+                      })}
+                      <input
+                        className="w-14 rounded-xl border border-emerald-200 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none transition focus:border-emerald-400 focus:ring-4 focus:ring-emerald-100"
+                        value={benchmarkRoundsInput}
+                        onChange={(e) => setBenchmarkRoundsInput(e.target.value.replace(/[^\d]/g, "").slice(0, 1))}
+                        inputMode="numeric"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 lg:justify-end">
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={selectVisibleProbeModels}
+                      disabled={visibleBenchmarkableModels.length === 0}
+                    >
+                      当前筛选全选
+                    </button>
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={selectAllProbeModels}
+                      disabled={probeDialogModels.filter((item) => item.benchmarkable).length === 0}
+                    >
+                      全选可测
+                    </button>
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={clearSelectedProbeModels}
+                      disabled={selectedProbeModels.length === 0}
+                    >
+                      清空选择
+                    </button>
+                    <button
+                      type="button"
+                      className={btnPrimary}
+                      onClick={() => benchmarkModels(benchmarkDialogItem, benchmarkActionModels, benchmarkRounds)}
+                      disabled={Boolean(activeBenchmarkBatch) || benchmarkActionModels.length === 0}
+                    >
+                      {activeBenchmarkBatch ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
+                      <span>开始测试 {benchmarkActionModels.length}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-zinc-600">
+                  <span>当前模型：{benchmarkDialogItem.model || "未设置"}</span>
+                  <span>可测试：{probeDialogModels.filter((item) => item.benchmarkable).length} 个</span>
+                  <span>本次目标：{benchmarkActionModels.length} 个</span>
+                  <span>
+                    {activeBenchmarkBatch ? `本次完成：${benchmarkResults.length}/${activeBenchmarkBatch.total}` : `最新结果：${benchmarkResults.length} 个`}
+                  </span>
+                </div>
+              </div>
+
+              <div
+                className={`grid min-h-0 flex-1 gap-4 overflow-hidden p-4 sm:p-5 ${
+                  benchmarkListCollapsed
+                    ? "xl:grid-cols-[minmax(17rem,0.34fr)_minmax(0,1fr)]"
+                    : "xl:grid-cols-[minmax(0,0.9fr)_minmax(22rem,1.1fr)]"
+                }`}
+              >
+                <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 px-3 py-3">
+                    <div>
+                      <p className="text-sm font-semibold text-zinc-900">模型列表</p>
+                      <p className="text-xs text-zinc-500">
+                        显示 {filteredProbeModels.length} / {probeDialogModels.length} 个模型
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="rounded-full bg-zinc-100 px-2.5 py-1 text-[11px] font-semibold text-zinc-600">
+                        已选 {selectedProbeModels.length}
+                      </div>
+                      <button
+                        type="button"
+                        className={smallBtn}
+                        onClick={() => setBenchmarkListCollapsed((prev) => !prev)}
+                        aria-expanded={!benchmarkListCollapsed}
+                      >
+                        {benchmarkListCollapsed ? <FaChevronDown aria-hidden /> : <FaChevronUp aria-hidden />}
+                        <span>{benchmarkListCollapsed ? "展开" : "折叠"}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {activeBenchmarkBatch ? (
+                    <div className="border-b border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-900">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          正在测试 {activeBenchmarkBatch.done} / {activeBenchmarkBatch.total} 个模型
+                          {activeBenchmarkBatch.skipped > 0 ? `，已跳过 ${activeBenchmarkBatch.skipped}` : ""}
+                        </div>
+                        <div className="text-xs font-semibold">
+                          {activeBenchmarkBatch.currentModel || "-"} · 第 {activeBenchmarkBatch.currentRound || 1}/{activeBenchmarkBatch.rounds} 次
+                        </div>
+                      </div>
+                      <div className="mt-2 h-2 overflow-hidden rounded-full bg-amber-100">
+                        <div
+                          className="h-full rounded-full bg-amber-500 transition-all duration-300"
+                          style={{ width: `${activeBenchmarkProgressPercent}%` }}
+                        />
+                      </div>
+                      <div className="mt-1 text-[11px] text-amber-700">总进度 {activeBenchmarkProgressPercent}%</div>
+                    </div>
+                  ) : null}
+
+                  {benchmarkListCollapsed ? (
+                    <div className="px-3 py-4 text-sm text-zinc-500">
+                      模型列表已折叠。你可以手动展开继续多选或切换当前模型。
+                    </div>
+                  ) : filteredProbeModels.length > 0 ? (
+                    <div className="min-h-0 flex-1 overflow-y-auto pb-3">
+                      {filteredProbeModels.map((entry) => {
+                        const selected = selectedProbeModels.includes(entry.model);
+                        const benchmark = entry.benchmark;
+
+                        return (
+                          <div
+                            key={entry.model}
+                            className={`grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 border-b border-zinc-200 px-3 py-2 last:border-b-0 ${
+                              entry.isCurrent ? "bg-emerald-50/60" : "bg-white"
+                            }`}
+                          >
+                            <label className={`inline-flex items-center ${entry.benchmarkable ? "text-zinc-900" : "text-zinc-400"}`}>
+                              <input
+                                type="checkbox"
+                                checked={selected}
+                                disabled={!entry.benchmarkable}
+                                onChange={() => toggleProbeModelSelection(entry.model)}
+                                className="h-4 w-4 rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500"
+                              />
+                            </label>
+
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className={`truncate text-sm font-semibold ${entry.benchmarkable ? "text-zinc-900" : "text-zinc-400"}`}>
+                                  {entry.model}
+                                </span>
+                                {entry.isCurrent ? (
+                                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-emerald-700">
+                                    当前
+                                  </span>
+                                ) : null}
+                                {!entry.benchmarkable ? (
+                                  <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                                    不支持
+                                  </span>
+                                ) : null}
+                              </div>
+
+                              {entry.tags.length > 0 ? (
+                                <div className="mt-1 flex flex-wrap gap-1.5">
+                                  {entry.tags.map((tag) => (
+                                    <span
+                                      key={`${entry.model}-${tag}`}
+                                      className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${getTagClassName(tag)}`}
+                                    >
+                                      {tag}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : null}
+
+                              <div className="mt-1 text-xs text-zinc-500">
+                                {benchmark.speed
+                                  ? `平均 ${formatDurationLabel(benchmark.speed.avgMs)} · 中位 ${formatDurationLabel(
+                                      benchmark.speed.medianMs
+                                    )} · 首字 ${formatDurationLabel(benchmark.speed.firstTokenMedianMs)} · 成功 ${formatSuccessRateLabel(
+                                      benchmark.speed.successRate
+                                    )}`
+                                  : benchmark.detail || "暂无测试结果"}
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition ${
+                                entry.isCurrent
+                                  ? "border-emerald-200 bg-emerald-100 text-emerald-700"
+                                  : "border-zinc-300 bg-white text-zinc-700 hover:border-zinc-400 hover:bg-zinc-50"
+                              }`}
+                              onClick={() => applyProbeModel(benchmarkDialogItem.id, entry.model)}
+                              disabled={entry.isCurrent}
+                              title={entry.isCurrent ? `${entry.model} 已是当前模型` : "设为当前模型"}
+                              aria-label={entry.isCurrent ? `${entry.model} 已是当前模型` : "设为当前模型"}
+                            >
+                              <FaExchangeAlt aria-hidden />
+                              <span>{entry.isCurrent ? "当前" : "设为当前"}</span>
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="px-3 py-6 text-sm text-zinc-500">当前搜索条件下没有可展示的模型</div>
+                  )}
+                </section>
+
+                <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-50">
+                  <div className="border-b border-zinc-200 px-4 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-zinc-900">最新测试结果</p>
+                        <p className="mt-1 text-xs text-zinc-500">
+                          {activeBenchmarkBatch
+                            ? `测试进行中：${benchmarkResults.length}/${activeBenchmarkBatch.total} 个模型已返回结果`
+                            : activeBenchmarkSummary?.finishedAt
+                              ? `更新时间：${toDateTimeLabel(activeBenchmarkSummary.finishedAt)}`
+                              : "尚未开始性能评测"}
+                        </p>
+                      </div>
+                      {activeBenchmarkSummary?.recommendedModel ? (
+                        <button
+                          type="button"
+                          className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700"
+                          onClick={() => setBenchmarkChartModel(activeBenchmarkSummary.recommendedModel || "")}
+                        >
+                          推荐：{activeBenchmarkSummary.recommendedModel}
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  {activeBenchmarkSummary ? (
+                    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 pb-8 sm:pb-10">
+                      {failedBenchmarkResults.length > 0 ? (
+                        <div className="mb-3 rounded-2xl border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-800">
+                          本次有 {failedBenchmarkResults.length} 个模型返回失败，表格里已用红色标出；把鼠标移到失败行或查看左侧列表，可看到错误原因。
+                        </div>
+                      ) : null}
+
+                      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">成功返回</p>
+                          <p className="mt-1 text-lg font-bold text-zinc-900">
+                            {activeBenchmarkSummary.successModels}/{activeBenchmarkSummary.totalModels}
+                          </p>
+                        </div>
+                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">最快模型</p>
+                          <p className="mt-1 text-sm font-semibold text-zinc-900">{activeBenchmarkSummary.fastestModel || "-"}</p>
+                          <p className="text-xs text-zinc-500">{formatDurationLabel(activeBenchmarkSummary.fastestMedianMs)}</p>
+                        </div>
+                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">首字最快</p>
+                          <p className="mt-1 text-sm font-semibold text-zinc-900">{activeBenchmarkSummary.quickestFirstTokenModel || "-"}</p>
+                          <p className="text-xs text-zinc-500">{formatDurationLabel(activeBenchmarkSummary.quickestFirstTokenMs)}</p>
+                        </div>
+                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">最稳模型</p>
+                          <p className="mt-1 text-sm font-semibold text-zinc-900">{activeBenchmarkSummary.mostStableModel || "-"}</p>
+                          <p className="text-xs text-zinc-500">波动 {formatDurationLabel(activeBenchmarkSummary.stabilityMs)}</p>
+                        </div>
+                        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-emerald-700">默认推荐</p>
+                          <p className="mt-1 text-sm font-semibold text-emerald-900">{activeBenchmarkSummary.recommendedModel || "-"}</p>
+                          <p className="text-xs text-emerald-800">优先成功率，再看中位耗时和波动。</p>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 rounded-2xl border border-zinc-200 bg-white">
+                        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 px-4 py-3">
+                          <div>
+                            <p className="text-sm font-semibold text-zinc-900">结果摘要</p>
+                            <p className="mt-1 text-xs text-zinc-500">这里先看每个模型的汇总指标；点右侧详情按钮再看每一轮的数据。</p>
+                          </div>
+                          {activeBenchmarkChartResult ? (
+                            <div className="rounded-full bg-zinc-100 px-2.5 py-1 text-[11px] font-semibold text-zinc-600">
+                              图表焦点：{activeBenchmarkChartResult.model}
+                            </div>
+                          ) : null}
+                        </div>
+
+                        {benchmarkResults.length > 0 ? (
+                          <div className="overflow-x-auto">
+                            <table className="min-w-full border-separate border-spacing-0 text-left text-sm">
+                              <thead className="bg-zinc-50 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                                <tr>
+                                  <th className="sticky left-0 z-10 bg-zinc-50 px-4 py-3">模型</th>
+                                  <th className="px-3 py-3">状态</th>
+                                  <th className="px-3 py-3">平均</th>
+                                  <th className="px-3 py-3">中位</th>
+                                  <th className="px-3 py-3">首字中位</th>
+                                  <th className="px-3 py-3">成功率</th>
+                                  <th className="px-3 py-3">详情</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {benchmarkResults.map((result) => {
+                                  const focused = activeBenchmarkChartResult?.model === result.model;
+                                  const failed = result.status === "error";
+
+                                  return (
+                                    <tr
+                                      key={result.model}
+                                      className={`cursor-pointer border-t border-zinc-200 text-zinc-700 transition ${
+                                        failed ? "bg-red-50/50 hover:bg-red-50" : "hover:bg-zinc-50"
+                                      } ${
+                                        focused ? "bg-emerald-50/60" : failed ? "bg-red-50/50" : "bg-white"
+                                      }`}
+                                      onClick={() => setBenchmarkChartModel(result.model)}
+                                    >
+                                      <td
+                                        className={`sticky left-0 z-10 px-4 py-3 align-top ${
+                                          focused ? "bg-emerald-50/60" : failed ? "bg-red-50/50" : "bg-white"
+                                        }`}
+                                      >
+                                        <div className="font-semibold text-zinc-900">{result.model}</div>
+                                        <div className="mt-1">
+                                          <span
+                                            className={`inline-flex w-fit items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                                              failed ? "bg-red-100 text-red-700" : "bg-zinc-100 text-zinc-600"
+                                            }`}
+                                          >
+                                            <StatusIcon status={result.status} />
+                                            <span>{failed ? "失败" : "完成"}</span>
+                                          </span>
+                                        </div>
+                                        {failed && result.detail ? (
+                                          <div className="mt-1 max-w-xs break-words text-[11px] leading-5 text-red-700">{result.detail}</div>
+                                        ) : null}
+                                      </td>
+                                      <td className="px-3 py-3 text-xs text-zinc-600">
+                                        <span
+                                          className={`inline-flex w-fit items-center gap-1 rounded-full px-2 py-0.5 font-semibold ${
+                                            failed ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"
+                                          }`}
+                                        >
+                                          <StatusIcon status={result.status} />
+                                          <span>{failed ? "失败" : "完成"}</span>
+                                        </span>
+                                      </td>
+                                      <td className="px-3 py-3 text-xs text-zinc-600">{formatDurationLabel(result.speed?.avgMs)}</td>
+                                      <td className="px-3 py-3 text-xs text-zinc-600">{formatDurationLabel(result.speed?.medianMs)}</td>
+                                      <td className="px-3 py-3 text-xs text-zinc-600">
+                                        {formatDurationLabel(result.speed?.firstTokenMedianMs)}
+                                      </td>
+                                      <td className="px-3 py-3 text-xs text-zinc-600">
+                                        {formatSuccessRateLabel(result.speed?.successRate)}
+                                      </td>
+                                      <td className="px-3 py-3 text-xs text-zinc-600">
+                                        <button
+                                          type="button"
+                                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900"
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            setBenchmarkChartModel(result.model);
+                                            setBenchmarkDetailModel(result.model);
+                                          }}
+                                          title={`查看 ${result.model} 详情`}
+                                          aria-label={`查看 ${result.model} 详情`}
+                                        >
+                                          <FaInfoCircle aria-hidden />
+                                        </button>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <div className="px-4 py-6 text-sm text-zinc-500">开始测试后，这里会展示每个模型的轮次明细。</div>
+                        )}
+                      </div>
+
+                      <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+                        <div className="rounded-2xl border border-zinc-200 bg-white p-3">
+                          <div className="mb-3">
+                            <p className="text-sm font-semibold text-zinc-900">模型对比</p>
+                            <p className="mt-1 text-xs text-zinc-500">柱状图对比平均耗时与中位耗时。</p>
+                          </div>
+                          {benchmarkComparisonChartOption ? (
+                            <ReactECharts option={benchmarkComparisonChartOption} style={{ height: 320, width: "100%" }} notMerge />
+                          ) : (
+                            <div className="flex h-80 items-center justify-center rounded-xl bg-zinc-50 text-sm text-zinc-500">
+                              暂无可绘制的图表数据
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="rounded-2xl border border-zinc-200 bg-white p-3">
+                          <div className="mb-3">
+                            <p className="text-sm font-semibold text-zinc-900">轮次走势</p>
+                            <p className="mt-1 text-xs text-zinc-500">
+                              {activeBenchmarkChartResult ? `${activeBenchmarkChartResult.model} 的每轮总耗时和首字时间。` : "点击上表中的模型查看详情。"}
+                            </p>
+                          </div>
+                          {benchmarkRoundChartOption ? (
+                            <ReactECharts option={benchmarkRoundChartOption} style={{ height: 320, width: "100%" }} notMerge />
+                          ) : (
+                            <div className="flex h-80 items-center justify-center rounded-xl bg-zinc-50 text-sm text-zinc-500">
+                              选择一个已有测速结果的模型后，这里显示轮次曲线
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {activeBenchmarkDetailResult ? (
+                        <div className="fixed inset-0 z-40 flex items-center justify-center bg-zinc-950/35 px-4">
+                          <div className="max-h-[min(78vh,42rem)] w-full max-w-2xl overflow-hidden rounded-3xl border border-zinc-200 bg-white shadow-2xl">
+                            <div className="flex items-start justify-between gap-3 border-b border-zinc-200 px-4 py-4">
+                              <div>
+                                <p className="text-base font-semibold text-zinc-900">{activeBenchmarkDetailResult.model}</p>
+                                <p className="mt-1 text-sm text-zinc-500">查看该模型每一轮的总耗时、首字时间和错误信息。</p>
+                              </div>
+                              <button type="button" className={smallBtn} onClick={() => setBenchmarkDetailModel("")}>
+                                <FaTimesCircle aria-hidden />
+                                <span>关闭</span>
+                              </button>
+                            </div>
+
+                            <div className="max-h-[calc(min(78vh,42rem)-5rem)] overflow-y-auto px-4 py-4">
+                              <div className="grid gap-2 sm:grid-cols-4">
+                                <div className="rounded-2xl border border-zinc-200 bg-zinc-50 px-3 py-2.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">状态</p>
+                                  <p className={`mt-1 text-sm font-semibold ${activeBenchmarkDetailResult.status === "error" ? "text-red-700" : "text-zinc-900"}`}>
+                                    {activeBenchmarkDetailResult.status === "error" ? "失败" : "完成"}
+                                  </p>
+                                </div>
+                                <div className="rounded-2xl border border-zinc-200 bg-zinc-50 px-3 py-2.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">平均</p>
+                                  <p className="mt-1 text-sm font-semibold text-zinc-900">{formatDurationLabel(activeBenchmarkDetailResult.speed?.avgMs)}</p>
+                                </div>
+                                <div className="rounded-2xl border border-zinc-200 bg-zinc-50 px-3 py-2.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">中位</p>
+                                  <p className="mt-1 text-sm font-semibold text-zinc-900">{formatDurationLabel(activeBenchmarkDetailResult.speed?.medianMs)}</p>
+                                </div>
+                                <div className="rounded-2xl border border-zinc-200 bg-zinc-50 px-3 py-2.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">首字中位</p>
+                                  <p className="mt-1 text-sm font-semibold text-zinc-900">
+                                    {formatDurationLabel(activeBenchmarkDetailResult.speed?.firstTokenMedianMs)}
+                                  </p>
+                                </div>
+                              </div>
+
+                              {activeBenchmarkDetailResult.detail ? (
+                                <div
+                                  className={`mt-3 rounded-2xl border px-3 py-2.5 text-sm leading-6 ${
+                                    activeBenchmarkDetailResult.status === "error"
+                                      ? "border-red-200 bg-red-50 text-red-800"
+                                      : "border-zinc-200 bg-zinc-50 text-zinc-700"
+                                  }`}
+                                >
+                                  {activeBenchmarkDetailResult.detail}
+                                </div>
+                              ) : null}
+
+                              <div className="mt-4 overflow-x-auto rounded-2xl border border-zinc-200">
+                                <table className="min-w-full border-separate border-spacing-0 text-left text-sm">
+                                  <thead className="bg-zinc-50 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                                    <tr>
+                                      <th className="px-4 py-3">轮次</th>
+                                      <th className="px-4 py-3">状态</th>
+                                      <th className="px-4 py-3">总耗时</th>
+                                      <th className="px-4 py-3">首字时间</th>
+                                      <th className="px-4 py-3">错误信息</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {getBenchmarkRoundDetails(activeBenchmarkDetailResult).map((detail) => (
+                                      <tr key={`${activeBenchmarkDetailResult.model}-detail-${detail.round}`} className="border-t border-zinc-200 bg-white">
+                                        <td className="px-4 py-3 text-zinc-700">第 {detail.round} 轮</td>
+                                        <td className="px-4 py-3">
+                                          <span
+                                            className={`inline-flex w-fit items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                                              detail.ok ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
+                                            }`}
+                                          >
+                                            <StatusIcon status={detail.ok ? "success" : "error"} />
+                                            <span>{detail.ok ? "成功" : "失败"}</span>
+                                          </span>
+                                        </td>
+                                        <td className="px-4 py-3 text-zinc-700">{detail.ok ? formatDurationLabel(detail.elapsedMs) : "-"}</td>
+                                        <td className="px-4 py-3 text-zinc-700">{detail.ok ? formatDurationLabel(detail.firstTokenMs) : "-"}</td>
+                                        <td className="px-4 py-3 text-xs leading-5 text-zinc-500">{detail.error || "-"}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div className="px-4 py-6 text-sm text-zinc-500">选择模型并开始测试后，这里会展示最新结果、轮次明细和图表。</div>
+                  )}
+                </section>
+              </div>
+            </div>
           </div>
         </div>
       ) : null}
