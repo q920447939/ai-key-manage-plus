@@ -2,7 +2,6 @@
 
 import dynamic from "next/dynamic";
 import Image from "next/image";
-import OpenAI from "openai";
 import type { EChartsOption } from "echarts";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -27,6 +26,11 @@ import {
   FaTrashAlt,
   FaVial
 } from "react-icons/fa";
+import type {
+  OpenAIProxyBenchmarkRoundResponse,
+  OpenAIProxyProbeResponse,
+  OpenAIProxyTestResponse
+} from "@/lib/openai-proxy-types";
 
 type KeyConfig = {
   id: string;
@@ -150,7 +154,6 @@ const LEGACY_STORAGE_KEYS = ["ai-key-vault-configs", "ai-key-check-configs-v1"];
 const INTRO_SEEN_KEY = "ai-key-vault-intro-seen-v1";
 const PASS_TEXT = "主人，快鞭策我吧";
 const FAIL_TEXT = "主人，我不行了";
-const MODEL_CANDIDATES = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5-mini", "gpt-5"];
 const DEFAULT_BENCHMARK_ROUNDS = 2;
 const MODEL_TAG_RULES: { tag: string; patterns: RegExp[] }[] = [
   { tag: "image", patterns: [/\bimage\b/i, /\bvision\b/i, /\bvl\b/i, /\bflux\b/i, /\bsd(?:xl)?\b/i, /stable[- ]?diffusion/i] },
@@ -729,22 +732,6 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.map((item) => item.trim()).filter(Boolean))];
 }
 
-function toReadableResponseText(content: unknown): string {
-  if (typeof content === "string") return cleanOneLineText(content);
-  if (!Array.isArray(content)) return "";
-
-  const texts = content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (!isRecord(part)) return "";
-      const text = part.text;
-      return typeof text === "string" ? text : "";
-    })
-    .filter(Boolean);
-
-  return cleanOneLineText(texts.join(" "));
-}
-
 function safeDateToIso(input: unknown): string {
   if (typeof input !== "string") return "";
   const d = new Date(input);
@@ -936,10 +923,6 @@ function inferModelTags(model: string): string[] {
   }
 
   return uniqueStrings(out);
-}
-
-function stripCodeFence(text: string): string {
-  return text.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
 }
 
 function normalizeFinishedBenchmarkResult(
@@ -1183,35 +1166,6 @@ function getSourceBadge(meta?: KeyConfig["sourceMeta"]): string {
   return "手动";
 }
 
-function chooseRecommendedModel(currentModel: string, models: string[]): string {
-  const normalized = models.map((item) => item.trim()).filter(Boolean);
-  const current = currentModel.trim();
-  if (current && normalized.includes(current)) return current;
-
-  for (const candidate of MODEL_CANDIDATES) {
-    if (normalized.includes(candidate)) return candidate;
-  }
-
-  return normalized[0] || "";
-}
-
-function extractModelsFromResponse(input: unknown): string[] {
-  if (!isRecord(input) || !Array.isArray(input.data)) return [];
-
-  const out: string[] = [];
-  const seen = new Set<string>();
-
-  for (const item of input.data) {
-    if (!isRecord(item)) continue;
-    const id = typeof item.id === "string" ? item.id.trim() : "";
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    out.push(id);
-  }
-
-  return out;
-}
-
 async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<unknown> {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -1237,6 +1191,20 @@ async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: n
   } finally {
     window.clearTimeout(timer);
   }
+}
+
+async function postJsonWithTimeout<TResponse>(url: string, body: unknown, timeoutMs: number): Promise<TResponse> {
+  return (await fetchJsonWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    },
+    timeoutMs
+  )) as TResponse;
 }
 
 function inferCcSwitchHomepage(endpoint: string): string {
@@ -1273,212 +1241,11 @@ function buildCcSwitchDeepLink(item: KeyConfig, app: CcSwitchApp): string {
   return `ccswitch://v1/import?${params.toString()}`;
 }
 
-function makeOpenAIClient(baseUrl: string, apiKey: string) {
-  return new OpenAI({
-    apiKey,
-    baseURL: baseUrl,
-    timeout: 12000,
-    maxRetries: 0,
-    dangerouslyAllowBrowser: true
-  });
-}
-
-async function requestModelText(
-  client: OpenAI,
-  model: string,
-  prompt: string,
-  maxTokens: number
-): Promise<{ ok: boolean; text: string; elapsedMs: number; error?: string }> {
-  const startedAt = performance.now();
-
-  try {
-    const response = await client.chat.completions.create({
-      model,
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: maxTokens
-    });
-
-    const elapsedMs = Math.round(performance.now() - startedAt);
-    const responseHasError = isRecord(response) && "error" in response;
-    if (responseHasError) {
-      return {
-        ok: false,
-        text: "",
-        elapsedMs,
-        error: getErrorMessage(response) || "模型不可用或上游渠道异常"
-      };
-    }
-
-    const content = response.choices[0]?.message?.content;
-    const text = toReadableResponseText(content);
-    if (text || content) {
-      return { ok: true, text, elapsedMs };
-    }
-
-    return { ok: false, text: "", elapsedMs, error: "未返回消息内容" };
-  } catch (error: unknown) {
-    return {
-      ok: false,
-      text: "",
-      elapsedMs: Math.round(performance.now() - startedAt),
-      error: makeErrorDetail(error)
-    };
-  }
-}
-
-function extractStreamDeltaText(payload: unknown): string {
-  if (!isRecord(payload) || !Array.isArray(payload.choices)) return "";
-
-  const firstChoice = payload.choices[0];
-  if (!isRecord(firstChoice)) return "";
-
-  const delta = firstChoice.delta;
-  if (!isRecord(delta)) return "";
-
-  const directContent = delta.content;
-  if (typeof directContent === "string") return directContent;
-
-  if (Array.isArray(directContent)) {
-    return directContent
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (!isRecord(part)) return "";
-        return typeof part.text === "string" ? part.text : "";
-      })
-      .join("");
-  }
-
-  const reasoningContent = delta.reasoning_content;
-  if (typeof reasoningContent === "string") return reasoningContent;
-
-  return "";
-}
-
-async function readStreamError(response: Response): Promise<string> {
-  try {
-    const payload = (await response.clone().json()) as unknown;
-    const message = getErrorMessage(payload);
-    if (message) return message;
-  } catch {
-    // Ignore parse errors and fall back to raw text.
-  }
-
-  try {
-    const rawText = await response.text();
-    const cleaned = cleanOneLineText(rawText, 260);
-    if (cleaned) return cleaned;
-  } catch {
-    // Ignore read errors and fall back to status code.
-  }
-
-  return `HTTP ${response.status}`;
-}
-
-async function requestModelTextStream(
-  baseUrl: string,
-  apiKey: string,
-  model: string,
-  prompt: string,
-  maxTokens: number
-): Promise<{ ok: boolean; text: string; elapsedMs: number; firstTokenMs?: number; error?: string }> {
-  const startedAt = performance.now();
-
-  try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: maxTokens,
-        stream: true
-      })
-    });
-
-    if (!response.ok) {
-      return {
-        ok: false,
-        text: "",
-        elapsedMs: Math.round(performance.now() - startedAt),
-        error: await readStreamError(response)
-      };
-    }
-
-    if (!response.body) {
-      return {
-        ok: false,
-        text: "",
-        elapsedMs: Math.round(performance.now() - startedAt),
-        error: "流式响应不可用"
-      };
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let collectedText = "";
-    let firstTokenMs: number | undefined;
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const chunks = buffer.split("\n\n");
-      buffer = chunks.pop() || "";
-
-      for (const chunk of chunks) {
-        const lines = chunk
-          .split("\n")
-          .map((line) => line.trim())
-          .filter((line) => line.startsWith("data:"));
-
-        for (const line of lines) {
-          const data = line.replace(/^data:\s*/, "");
-          if (!data || data === "[DONE]") continue;
-
-          try {
-            const payload = JSON.parse(data) as unknown;
-            const deltaText = extractStreamDeltaText(payload);
-            if (!deltaText) continue;
-            if (firstTokenMs === undefined) {
-              firstTokenMs = Math.round(performance.now() - startedAt);
-            }
-            collectedText += deltaText;
-          } catch {
-            // Ignore malformed SSE events from relays and continue reading.
-          }
-        }
-      }
-    }
-
-    const elapsedMs = Math.round(performance.now() - startedAt);
-    const text = cleanOneLineText(stripCodeFence(collectedText), 260);
-    if (!text) {
-      return { ok: false, text: "", elapsedMs, error: "流式响应未返回可读内容" };
-    }
-
-    return {
-      ok: true,
-      text,
-      elapsedMs,
-      firstTokenMs
-    };
-  } catch (error: unknown) {
-    return {
-      ok: false,
-      text: "",
-      elapsedMs: Math.round(performance.now() - startedAt),
-      error: makeErrorDetail(error)
-    };
-  }
-}
-
 function getErrorMessage(error: unknown): string {
   if (!isRecord(error)) return "";
+
+  const directError = error.error;
+  if (typeof directError === "string" && directError.trim()) return cleanOneLineText(directError, 260);
 
   const directMessage = error.message;
   if (typeof directMessage === "string" && directMessage.trim()) return cleanOneLineText(directMessage, 260);
@@ -2391,23 +2158,23 @@ export default function Home() {
     }
 
     try {
-      const client = makeOpenAIClient(baseUrl, apiKey);
-      const response = await requestModelText(client, item.model || "gpt-4o-mini", "你好，请回复：ok", 16);
+      const response = await postJsonWithTimeout<OpenAIProxyTestResponse>(
+        "/api/openai/test",
+        {
+          baseUrl,
+          apiKey,
+          model: item.model || "gpt-4o-mini"
+        },
+        15000
+      );
 
-      if (response.ok) {
-        commitFinishedTestResult(item.id, {
-          status: "success",
-          message: PASS_TEXT,
-          detail: response.text ? `接口返回：${response.text}` : "返回消息正常",
-          testedAt: new Date().toISOString()
-        });
-        return true;
-      }
-
+      commitFinishedTestResult(item.id, response.result);
+      return response.ok;
+    } catch (error: unknown) {
       commitFinishedTestResult(item.id, {
         status: "error",
         message: FAIL_TEXT,
-        detail: response.error || "未返回消息内容",
+        detail: makeErrorDetail(error),
         testedAt: new Date().toISOString()
       });
       return false;
@@ -2443,71 +2210,23 @@ export default function Home() {
       return false;
     }
 
-    let modelsError = "";
-
     try {
-      const payload = await fetchJsonWithTimeout(
-        `${baseUrl}/models`,
+      const response = await postJsonWithTimeout<OpenAIProxyProbeResponse>(
+        "/api/openai/probe",
         {
-          headers: {
-            Authorization: `Bearer ${apiKey}`
-          }
+          baseUrl,
+          apiKey,
+          currentModel: item.model
         },
-        10000
+        20000
       );
-      const supportedModels = extractModelsFromResponse(payload);
-      if (supportedModels.length > 0) {
-        commitFinishedProbeResult(item.id, {
-          status: "success",
-          supportedModels,
-          recommendedModel: chooseRecommendedModel(item.model, supportedModels) || undefined,
-          detail: `读取 /models 成功，共识别 ${supportedModels.length} 个模型`,
-          testedAt: new Date().toISOString()
-        });
-        return true;
-      }
-      modelsError = "/models 可达，但未返回可识别模型";
-    } catch (error: unknown) {
-      modelsError = makeErrorDetail(error);
-    }
-
-    try {
-      const client = makeOpenAIClient(baseUrl, apiKey);
-      const supportedModels: string[] = [];
-      let fallbackError = "";
-
-      for (const candidate of MODEL_CANDIDATES) {
-        const response = await requestModelText(client, candidate, "你好，请回复：ok", 12);
-        if (response.ok) {
-          supportedModels.push(candidate);
-          continue;
-        }
-        if (!fallbackError && response.error) fallbackError = response.error;
-      }
-
-      if (supportedModels.length > 0) {
-        commitFinishedProbeResult(item.id, {
-          status: "success",
-          supportedModels,
-          recommendedModel: chooseRecommendedModel(item.model, supportedModels) || undefined,
-          detail: `已通过候选模型试探识别 ${supportedModels.length} 个模型${modelsError ? `；/models：${modelsError}` : ""}`,
-          testedAt: new Date().toISOString()
-        });
-        return true;
-      }
-
-      commitFinishedProbeResult(item.id, {
-        status: "error",
-        supportedModels: [],
-        detail: modelsError ? `${modelsError}${fallbackError ? `；候选试探：${fallbackError}` : ""}` : fallbackError || "未探测到可用模型",
-        testedAt: new Date().toISOString()
-      });
-      return false;
+      commitFinishedProbeResult(item.id, response.result);
+      return response.ok;
     } catch (error: unknown) {
       commitFinishedProbeResult(item.id, {
         status: "error",
         supportedModels: [],
-        detail: modelsError ? `${modelsError}；候选试探：${makeErrorDetail(error)}` : makeErrorDetail(error),
+        detail: makeErrorDetail(error),
         testedAt: new Date().toISOString()
       });
       return false;
@@ -2537,7 +2256,6 @@ export default function Home() {
       return null;
     }
 
-    const client = makeOpenAIClient(baseUrl, apiKey);
     const elapsedSamples: number[] = [];
     const firstTokenSamples: number[] = [];
     const speedErrors: string[] = [];
@@ -2545,55 +2263,45 @@ export default function Home() {
 
     for (let round = 0; round < rounds; round += 1) {
       onRoundStart?.(model, round + 1);
-      const streamedResponse = await requestModelTextStream(
-        baseUrl,
-        apiKey,
-        model,
-        "Reply with exactly OK. Do not add anything else.",
-        8
-      );
+      try {
+        const response = await postJsonWithTimeout<OpenAIProxyBenchmarkRoundResponse>(
+          "/api/openai/benchmark",
+          {
+            baseUrl,
+            apiKey,
+            model
+          },
+          25000
+        );
 
-      if (streamedResponse.ok) {
-        elapsedSamples.push(streamedResponse.elapsedMs);
-        if (typeof streamedResponse.firstTokenMs === "number") {
-          firstTokenSamples.push(streamedResponse.firstTokenMs);
+        if (response.ok && response.sample) {
+          elapsedSamples.push(response.sample.elapsedMs);
+          if (typeof response.sample.firstTokenMs === "number") {
+            firstTokenSamples.push(response.sample.firstTokenMs);
+          }
+          roundDetails.push({
+            round: round + 1,
+            ok: true,
+            elapsedMs: response.sample.elapsedMs,
+            firstTokenMs: response.sample.firstTokenMs
+          });
+          continue;
         }
-        roundDetails.push({
-          round: round + 1,
-          ok: true,
-          elapsedMs: streamedResponse.elapsedMs,
-          firstTokenMs: streamedResponse.firstTokenMs
-        });
-        continue;
-      }
 
-      const fallbackResponse = await requestModelText(client, model, "Reply with exactly OK. Do not add anything else.", 8);
-      if (fallbackResponse.ok) {
-        elapsedSamples.push(fallbackResponse.elapsedMs);
-        roundDetails.push({
-          round: round + 1,
-          ok: true,
-          elapsedMs: fallbackResponse.elapsedMs
-        });
-      } else if (fallbackResponse.error) {
-        speedErrors.push(fallbackResponse.error);
+        const errorDetail = response.error || "测速失败，未返回可读内容";
+        speedErrors.push(errorDetail);
         roundDetails.push({
           round: round + 1,
           ok: false,
-          error: fallbackResponse.error
+          error: errorDetail
         });
-      } else if (streamedResponse.error) {
-        speedErrors.push(streamedResponse.error);
+      } catch (error: unknown) {
+        const errorDetail = makeErrorDetail(error);
+        speedErrors.push(errorDetail);
         roundDetails.push({
           round: round + 1,
           ok: false,
-          error: streamedResponse.error
-        });
-      } else {
-        roundDetails.push({
-          round: round + 1,
-          ok: false,
-          error: "测速失败，未返回可读内容"
+          error: errorDetail
         });
       }
     }
@@ -3082,7 +2790,7 @@ export default function Home() {
           <div>
             <p className="text-base font-extrabold text-emerald-900 sm:text-lg">这是你的 AI API Key 本地保险箱</p>
             <p className="mt-1 text-xs font-medium text-emerald-700/90">
-              {introExpanded ? "点击收起介绍" : "首次已展示，后续会默认折叠；点击可再次展开"}
+              {introExpanded ? "点击收起说明" : "包含本地保存、后端代理与使用说明；点击展开"}
             </p>
           </div>
           <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-emerald-200 bg-white/80 text-emerald-700">
@@ -3093,8 +2801,21 @@ export default function Home() {
         {introExpanded ? (
           <>
             <p className="mt-2 text-sm leading-6 text-emerald-800">
-              统一管理名称/地址/Key/模型，支持一键测试、模型识别、性能评测和唤起 CC Switch，数据仅存浏览器本地。
+              统一管理名称、地址、Key 和模型，支持一键测试、模型识别、性能评测和唤起 CC Switch；配置数据默认仅保存在当前浏览器本地。
             </p>
+            <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50/80 p-3">
+              <div className="flex items-start gap-2.5">
+                <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-amber-200 bg-white text-amber-700">
+                  <FaInfoCircle aria-hidden />
+                </span>
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-amber-900">请求说明</p>
+                  <p className="text-sm leading-6 text-amber-900/90">
+                    连通性测试、模型识别、性能评测这类真实联网请求会通过同源后端发起，避免浏览器直连部分上游接口时被 CORS 拦截。
+                  </p>
+                </div>
+              </div>
+            </div>
             <p className="mt-2 text-xs font-medium text-emerald-700/90">单条配置支持直接导出到 CC Switch。</p>
           </>
         ) : null}
