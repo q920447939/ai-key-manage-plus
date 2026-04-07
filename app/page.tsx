@@ -192,6 +192,7 @@ const smallDangerBtn =
   "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:border-red-700 hover:bg-red-700 hover:text-white";
 const iconCopyBtn =
   "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45";
+const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses；测试默认优先走流式，失败后自动回退普通响应。";
 const ReactECharts = dynamic(() => import("echarts-for-react"), { ssr: false });
 
 function normalizeBaseUrl(raw: string): string {
@@ -208,6 +209,7 @@ function toOpenAIBaseUrl(raw: string): string {
   const withoutEndpoint = normalized
     .replace(/\/chat\/completions$/i, "")
     .replace(/\/responses$/i, "")
+    .replace(/\/response$/i, "")
     .replace(/\/completions$/i, "");
 
   if (/\/v\d+$/i.test(withoutEndpoint)) return withoutEndpoint;
@@ -2167,7 +2169,7 @@ export default function Home() {
           apiKey,
           model: item.model || "gpt-4o-mini"
         },
-        15000
+        45000
       );
 
       commitFinishedTestResult(item.id, response.result);
@@ -2887,9 +2889,10 @@ export default function Home() {
               className={inputClass}
               value={form.baseUrl}
               onChange={(e) => setForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
-              placeholder="例如：https://api.openai.com/v1"
+              placeholder="例如：https://api.openai.com"
               required
             />
+            <p className="mt-1 text-[11px] leading-5 text-zinc-500">{endpointHintText}</p>
 
             <label className={labelClass}>Key</label>
             <input
@@ -2919,7 +2922,10 @@ export default function Home() {
 
         <section className="rounded-2xl border border-zinc-200 bg-white p-3.5 shadow-sm sm:p-4">
           <div className="mb-3 space-y-2">
-            <h2 className="text-base font-semibold whitespace-nowrap text-zinc-900">配置列表</h2>
+            <div className="flex items-center gap-1.5">
+              <h2 className="text-base font-semibold whitespace-nowrap text-zinc-900">配置列表</h2>
+              <HelpHint text={endpointHintText} />
+            </div>
             <div className="flex w-full flex-wrap items-center gap-2 pb-1">
               <button type="button" className={topBtnPrimary} onClick={testAllConfigs} disabled={testingAll}>
                 {testingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
@@ -2986,7 +2992,9 @@ export default function Home() {
                           className={inputClass}
                           value={editForm.baseUrl}
                           onChange={(e) => setEditForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
+                          placeholder="例如：https://api.openai.com"
                         />
+                        <p className="mt-1 text-[11px] leading-5 text-zinc-500">{endpointHintText}</p>
 
                         <label className={labelClass}>Key</label>
                         <input

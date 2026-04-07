@@ -55,6 +55,7 @@ function toOpenAIBaseUrl(raw: string): string {
   const withoutEndpoint = normalized
     .replace(/\/chat\/completions$/i, "")
     .replace(/\/responses$/i, "")
+    .replace(/\/response$/i, "")
     .replace(/\/completions$/i, "");
 
   if (/\/v\d+$/i.test(withoutEndpoint)) return withoutEndpoint;
@@ -79,6 +80,43 @@ function toReadableResponseText(content: unknown): string {
     .filter(Boolean);
 
   return cleanOneLineText(texts.join(" "));
+}
+
+function extractChatMessageContent(payload: unknown): unknown {
+  const firstChoice = isRecord(payload) && Array.isArray(payload.choices) ? payload.choices[0] : undefined;
+  const message = isRecord(firstChoice) ? firstChoice.message : undefined;
+  return isRecord(message) ? message.content : undefined;
+}
+
+function extractResponsesText(payload: unknown): string {
+  if (!isRecord(payload)) return "";
+
+  const directText = payload.output_text;
+  if (typeof directText === "string" && directText.trim()) {
+    return cleanOneLineText(directText);
+  }
+
+  if (!Array.isArray(payload.output)) return "";
+
+  const texts = payload.output
+    .flatMap((item) => {
+      if (!isRecord(item)) return [];
+
+      const content = item.content;
+      if (!Array.isArray(content)) return [];
+
+      return content
+        .map((part) => {
+          if (!isRecord(part)) return "";
+          if (typeof part.text === "string") return part.text;
+          if (typeof part.refusal === "string") return part.refusal;
+          return "";
+        })
+        .filter(Boolean);
+    })
+    .join(" ");
+
+  return cleanOneLineText(texts);
 }
 
 function getErrorMessage(error: unknown): string {
@@ -220,9 +258,7 @@ async function requestModelText(
       };
     }
 
-    const firstChoice = isRecord(payload) && Array.isArray(payload.choices) ? payload.choices[0] : undefined;
-    const message = isRecord(firstChoice) ? firstChoice.message : undefined;
-    const content = isRecord(message) ? message.content : undefined;
+    const content = extractChatMessageContent(payload);
     const text = toReadableResponseText(content);
 
     if (text || content) {
@@ -238,6 +274,175 @@ async function requestModelText(
       error: makeErrorDetail(error),
     };
   }
+}
+
+async function requestResponsesText(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  prompt: string,
+): Promise<ModelTextResult> {
+  const startedAt = performance.now();
+
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl}/responses`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          input: prompt,
+        }),
+      },
+      12000,
+    );
+
+    let payload: unknown = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+
+    const elapsedMs = Math.round(performance.now() - startedAt);
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        text: "",
+        elapsedMs,
+        error: getErrorMessage(payload) || `HTTP ${response.status}`,
+      };
+    }
+
+    if (isRecord(payload) && "error" in payload) {
+      return {
+        ok: false,
+        text: "",
+        elapsedMs,
+        error: getErrorMessage(payload) || "模型不可用或上游渠道异常",
+      };
+    }
+
+    const text = extractResponsesText(payload);
+    if (text) {
+      return { ok: true, text, elapsedMs };
+    }
+
+    return { ok: false, text: "", elapsedMs, error: "未返回消息内容" };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      text: "",
+      elapsedMs: Math.round(performance.now() - startedAt),
+      error: makeErrorDetail(error),
+    };
+  }
+}
+
+function shouldTryResponsesFallback(error: string): boolean {
+  return /404|not found|不存在|does not exist|unsupported/i.test(error);
+}
+
+async function requestModelTextBestEffort(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  prompt: string,
+  maxTokens: number,
+  options?: {
+    preferStream?: boolean;
+  },
+): Promise<ModelTextResult> {
+  if (options?.preferStream) {
+    const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, maxTokens);
+    if (streamResponse.ok) {
+      return {
+        ok: true,
+        text: streamResponse.text,
+        elapsedMs: streamResponse.elapsedMs,
+      };
+    }
+
+    const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, maxTokens);
+    if (chatResponse.ok) return chatResponse;
+
+    const shouldTryResponses =
+      chatResponse.error === "未返回消息内容" ||
+      shouldTryResponsesFallback(streamResponse.error || "") ||
+      shouldTryResponsesFallback(chatResponse.error || "");
+
+    if (shouldTryResponses) {
+      const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+      if (responsesResponse.ok) return responsesResponse;
+
+      return {
+        ok: false,
+        text: "",
+        elapsedMs: streamResponse.elapsedMs,
+        error:
+          uniqueStrings([
+            streamResponse.error || "",
+            chatResponse.error || "",
+            responsesResponse.error || "",
+          ])[0] || "请求失败",
+      };
+    }
+
+    return {
+      ok: false,
+      text: "",
+      elapsedMs: streamResponse.elapsedMs,
+      error: uniqueStrings([streamResponse.error || "", chatResponse.error || ""])[0] || "请求失败",
+    };
+  }
+
+  const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, maxTokens);
+  if (chatResponse.ok) return chatResponse;
+
+  if (chatResponse.error === "未返回消息内容") {
+    const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, maxTokens);
+    if (streamResponse.ok) {
+      return {
+        ok: true,
+        text: streamResponse.text,
+        elapsedMs: streamResponse.elapsedMs,
+      };
+    }
+
+    const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+    if (responsesResponse.ok) return responsesResponse;
+
+    return {
+      ok: false,
+      text: "",
+      elapsedMs: chatResponse.elapsedMs,
+      error:
+        uniqueStrings([
+          chatResponse.error || "",
+          streamResponse.error || "",
+          responsesResponse.error || "",
+        ])[0] || "未返回消息内容",
+    };
+  }
+
+  if (shouldTryResponsesFallback(chatResponse.error || "")) {
+    const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+    if (responsesResponse.ok) return responsesResponse;
+
+    return {
+      ok: false,
+      text: "",
+      elapsedMs: chatResponse.elapsedMs,
+      error: uniqueStrings([chatResponse.error || "", responsesResponse.error || ""])[0] || "请求失败",
+    };
+  }
+
+  return chatResponse;
 }
 
 function extractStreamDeltaText(payload: unknown): string {
@@ -441,7 +646,9 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
     };
   }
 
-  const response = await requestModelText(baseUrl, apiKey, input.model?.trim() || "gpt-4o-mini", "你好，请回复：ok", 16);
+  const response = await requestModelTextBestEffort(baseUrl, apiKey, input.model?.trim() || "gpt-4o-mini", "你好，请回复：ok", 16, {
+    preferStream: true,
+  });
 
   if (response.ok) {
     return {
@@ -518,7 +725,7 @@ export async function runOpenAIProbe(input: OpenAIProxyProbeRequest): Promise<Op
   let fallbackError = "";
 
   for (const candidate of MODEL_CANDIDATES) {
-    const response = await requestModelText(baseUrl, apiKey, candidate, "你好，请回复：ok", 12);
+    const response = await requestModelTextBestEffort(baseUrl, apiKey, candidate, "你好，请回复：ok", 12);
     if (response.ok) {
       supportedModels.push(candidate);
       continue;
@@ -589,7 +796,13 @@ export async function runOpenAIBenchmarkRound(
     };
   }
 
-  const fallbackResponse = await requestModelText(baseUrl, apiKey, model, "Reply with exactly OK. Do not add anything else.", 8);
+  const fallbackResponse = await requestModelTextBestEffort(
+    baseUrl,
+    apiKey,
+    model,
+    "Reply with exactly OK. Do not add anything else.",
+    8,
+  );
 
   if (fallbackResponse.ok) {
     return {
