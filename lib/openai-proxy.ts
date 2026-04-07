@@ -26,6 +26,11 @@ type StreamTextResult = {
   error?: string;
 };
 
+type TestResponseSource = "stream" | "chat" | "responses";
+type SourcedModelTextResult = ModelTextResult & {
+  source: TestResponseSource;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -37,8 +42,67 @@ function cleanOneLineText(input: string, maxLen = 220): string {
   return `${singleLine.slice(0, maxLen)}...`;
 }
 
+function cleanMultilineText(input: string, maxLen = 2000): string {
+  const normalized = input
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  if (!normalized) return "";
+  if (normalized.length <= maxLen) return normalized;
+  return `${normalized.slice(0, maxLen).trimEnd()}...`;
+}
+
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.map((item) => item.trim()).filter(Boolean))];
+}
+
+function isLowSignalResponseText(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return true;
+
+  return [
+    "ok",
+    "okay",
+    "ok.",
+    "ok!",
+    "ok？",
+    "ok?",
+    "好的",
+    "收到",
+    "收到。",
+    "已收到",
+    "明白",
+    "在",
+    "在的",
+    "hi",
+    "hello",
+  ].includes(normalized);
+}
+
+function scoreResponseText(text: string): number {
+  const normalized = text.trim();
+  if (!normalized) return -1;
+
+  let score = Math.min(normalized.length, 240);
+  if (/[\u4e00-\u9fa5]/.test(normalized)) score += 40;
+  if (!isLowSignalResponseText(normalized)) score += 120;
+  if (/[，。！？,.!?]/.test(normalized)) score += 20;
+  return score;
+}
+
+function pickBestTextResult(results: SourcedModelTextResult[]): SourcedModelTextResult | undefined {
+  const successful = results.filter((item) => item.ok && item.text.trim());
+  if (successful.length === 0) return undefined;
+
+  return [...successful].sort((left, right) => {
+    const scoreDiff = scoreResponseText(right.text) - scoreResponseText(left.text);
+    if (scoreDiff !== 0) return scoreDiff;
+    return left.elapsedMs - right.elapsedMs;
+  })[0];
 }
 
 function normalizeBaseUrl(raw: string): string {
@@ -67,7 +131,7 @@ function cleanKey(raw: string): string {
 }
 
 function toReadableResponseText(content: unknown): string {
-  if (typeof content === "string") return cleanOneLineText(content);
+  if (typeof content === "string") return cleanMultilineText(content);
   if (!Array.isArray(content)) return "";
 
   const texts = content
@@ -79,7 +143,7 @@ function toReadableResponseText(content: unknown): string {
     })
     .filter(Boolean);
 
-  return cleanOneLineText(texts.join(" "));
+  return cleanMultilineText(texts.join("\n"));
 }
 
 function extractChatMessageContent(payload: unknown): unknown {
@@ -93,7 +157,7 @@ function extractResponsesText(payload: unknown): string {
 
   const directText = payload.output_text;
   if (typeof directText === "string" && directText.trim()) {
-    return cleanOneLineText(directText);
+    return cleanMultilineText(directText);
   }
 
   if (!Array.isArray(payload.output)) return "";
@@ -114,9 +178,9 @@ function extractResponsesText(payload: unknown): string {
         })
         .filter(Boolean);
     })
-    .join(" ");
+    .join("\n");
 
-  return cleanOneLineText(texts);
+  return cleanMultilineText(texts);
 }
 
 function getErrorMessage(error: unknown): string {
@@ -579,7 +643,7 @@ async function requestModelTextStream(
     }
 
     const elapsedMs = Math.round(performance.now() - startedAt);
-    const text = cleanOneLineText(collectedText.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim(), 260);
+    const text = cleanMultilineText(collectedText.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim());
     if (!text) {
       return { ok: false, text: "", elapsedMs, error: "流式响应未返回可读内容" };
     }
@@ -633,6 +697,7 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
   const baseUrl = toOpenAIBaseUrl(input.baseUrl);
   const apiKey = cleanKey(input.apiKey);
   const testedAt = new Date().toISOString();
+  const prompt = "你是谁？请用一句简短中文回复，不要使用 Markdown。";
 
   if (!baseUrl || !apiKey) {
     return {
@@ -646,28 +711,54 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
     };
   }
 
-  const response = await requestModelTextBestEffort(baseUrl, apiKey, input.model?.trim() || "gpt-4o-mini", "你好，请回复：ok", 16, {
-    preferStream: true,
-  });
+  const model = input.model?.trim() || "gpt-4o-mini";
+  const attempts: SourcedModelTextResult[] = [];
 
-  if (response.ok) {
+  const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, 48);
+  attempts.push({ ...streamResponse, source: "stream" });
+
+  if (!(streamResponse.ok && !isLowSignalResponseText(streamResponse.text))) {
+    const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, 48);
+    attempts.push({ ...chatResponse, source: "chat" });
+
+    const shouldTryResponses =
+      !chatResponse.ok ||
+      isLowSignalResponseText(chatResponse.text) ||
+      shouldTryResponsesFallback(streamResponse.error || "") ||
+      shouldTryResponsesFallback(chatResponse.error || "");
+
+    if (shouldTryResponses) {
+      const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+      attempts.push({ ...responsesResponse, source: "responses" });
+    }
+  }
+
+  const bestResponse = pickBestTextResult(attempts);
+
+  if (bestResponse) {
+    const sourceLabel =
+      bestResponse.source === "stream" ? "流式" : bestResponse.source === "responses" ? "Responses" : "普通";
     return {
       ok: true,
       result: {
         status: "success",
         message: PASS_TEXT,
-        detail: response.text ? `接口返回：${response.text}` : "返回消息正常",
+        detail: bestResponse.text ? `接口连通，已收到对“你是谁”的简短回复（${sourceLabel}）` : "返回消息正常",
+        responseText: bestResponse.text || undefined,
+        responseSource: bestResponse.source,
         testedAt,
       },
     };
   }
+
+  const response = attempts[0];
 
   return {
     ok: false,
     result: {
       status: "error",
       message: FAIL_TEXT,
-      detail: response.error || "未返回消息内容",
+      detail: response?.error || uniqueStrings(attempts.map((item) => item.error || ""))[0] || "未返回消息内容",
       testedAt,
     },
   };

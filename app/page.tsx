@@ -55,6 +55,8 @@ type KeyConfig = {
     status: "success" | "error";
     message: string;
     detail?: string;
+    responseText?: string;
+    responseSource?: "stream" | "chat" | "responses";
     testedAt: string;
   };
   benchmarks?: Record<string, FinishedModelBenchmarkResult>;
@@ -75,6 +77,8 @@ type TestResult = {
   status: TestStatus;
   message: string;
   detail?: string;
+  responseText?: string;
+  responseSource?: "stream" | "chat" | "responses";
   testedAt?: string;
 };
 type FinishedTestResult = NonNullable<KeyConfig["lastTest"]>;
@@ -192,7 +196,7 @@ const smallDangerBtn =
   "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:border-red-700 hover:bg-red-700 hover:text-white";
 const iconCopyBtn =
   "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45";
-const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses；测试默认优先走流式，失败后自动回退普通响应。";
+const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses；测试会兼容流式、普通响应和 Responses，并优先展示信息量更高的那份回复。";
 const ReactECharts = dynamic(() => import("echarts-for-react"), { ssr: false });
 
 function normalizeBaseUrl(raw: string): string {
@@ -732,6 +736,20 @@ function cleanOneLineText(input: string, maxLen = 220): string {
   return `${singleLine.slice(0, maxLen)}...`;
 }
 
+function cleanMultilineText(input: string, maxLen = 2000): string {
+  const normalized = input
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  if (!normalized) return "";
+  if (normalized.length <= maxLen) return normalized;
+  return `${normalized.slice(0, maxLen).trimEnd()}...`;
+}
+
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.map((item) => item.trim()).filter(Boolean))];
 }
@@ -818,7 +836,16 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
   if (status !== "success" && status !== "error") return undefined;
 
   const message = typeof input.message === "string" && input.message.trim() ? input.message.trim() : "";
-  const detail = typeof input.detail === "string" && input.detail.trim() ? cleanOneLineText(input.detail, 300) : "";
+  const rawDetail = typeof input.detail === "string" && input.detail.trim() ? input.detail.trim() : "";
+  const legacyResponseText = rawDetail.startsWith("接口返回：") ? rawDetail.slice("接口返回：".length).trim() : "";
+  const responseTextSource =
+    typeof input.responseText === "string" && input.responseText.trim() ? input.responseText : legacyResponseText;
+  const responseText = responseTextSource ? cleanMultilineText(responseTextSource, 2000) : "";
+  const responseSource =
+    input.responseSource === "stream" || input.responseSource === "chat" || input.responseSource === "responses"
+      ? input.responseSource
+      : undefined;
+  const detail = rawDetail && !legacyResponseText ? cleanOneLineText(rawDetail, 300) : responseText ? "接口连通，已收到模型回复" : "";
   const testedAt = safeDateToIso(input.testedAt);
 
   if (!testedAt) return undefined;
@@ -827,6 +854,8 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
     status,
     message: message || (status === "success" ? PASS_TEXT : FAIL_TEXT),
     detail: detail || undefined,
+    responseText: responseText || undefined,
+    responseSource,
     testedAt
   };
 }
@@ -1369,6 +1398,13 @@ function loadConfigsFromStorage(storage: Storage): { configs: KeyConfig[]; sourc
 
 function defaultTestResult(): TestResult {
   return { status: "idle", message: "未测试" };
+}
+
+function testResponseSourceLabel(source?: TestResult["responseSource"]): string {
+  if (source === "stream") return "流式";
+  if (source === "responses") return "Responses";
+  if (source === "chat") return "普通";
+  return "";
 }
 
 function statusPillClass(status: TestStatus): string {
@@ -3139,6 +3175,23 @@ export default function Home() {
                                 </details>
                               ) : result.detail ? (
                                 <span className="text-xs text-zinc-500">{result.detail}</span>
+                              ) : null}
+                              {result.responseText ? (
+                                <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 p-3">
+                                  <div className="mb-1 flex flex-wrap items-center gap-2">
+                                    <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-emerald-700">
+                                      AI 返回内容
+                                    </div>
+                                    {result.responseSource ? (
+                                      <span className="rounded-full border border-emerald-300 bg-white/70 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                                        来源：{testResponseSourceLabel(result.responseSource)}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                  <div className="whitespace-pre-wrap break-words text-xs leading-5 text-emerald-950">
+                                    {result.responseText}
+                                  </div>
+                                </div>
                               ) : null}
                               {item.lastTest?.testedAt ? (
                                 <span className="text-xs text-zinc-500">

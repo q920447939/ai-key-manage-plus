@@ -13,6 +13,8 @@ export type OpenAIProxyTestResponse = {
     status: "success" | "error";
     message: string;
     detail?: string;
+    responseText?: string;
+    responseSource?: "stream" | "chat" | "responses";
     testedAt: string;
   };
 };
