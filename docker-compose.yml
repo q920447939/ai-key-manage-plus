@@ -1,0 +1,20 @@
+services:
+  ai-key-vault:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-key-vault
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      DATABASE_PATH: /app/data/ai-key-vault.db
+      AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET is required}
+      DEFAULT_USERNAME_B64: ${DEFAULT_USERNAME_B64:?DEFAULT_USERNAME_B64 is required}
+      DEFAULT_PASSWORD_B64: ${DEFAULT_PASSWORD_B64:?DEFAULT_PASSWORD_B64 is required}
+    volumes:
+      - ai-key-vault-data:/app/data
+
+volumes:
+  ai-key-vault-data:

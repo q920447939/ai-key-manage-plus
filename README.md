@@ -6,12 +6,20 @@
 
 如果你手里经常有多套 OpenAI 兼容渠道，或者总在不同平台之间来回复制 Key，这个项目基本就是为这种场景准备的。
 
+
+
+# 效果
+
+![](./img/01.png)
+
+
+
 ## 现在已经支持什么
 
 ### 🔐 配置管理
 
-- 本地保存多组配置，包含名称、Base URL、API Key、默认模型
-- 自动兼容旧版本本地数据，打开页面后会尽量把历史配置接回来
+- 配置默认保存到服务器本地 `SQLite` 数据库，多个浏览器登录后都能访问同一份数据
+- 自动兼容旧版本浏览器本地数据，数据库为空时会尝试把旧 `localStorage` 配置迁移进去
 - 支持复制单条配置，也支持复制全部配置
 - 支持导出 `.txt` 和 `.md`
 
@@ -32,6 +40,7 @@
 - 支持读取当前 Key 在该渠道下能看到的模型列表
 - 识别完成后会给出推荐模型，并支持复制模型列表
 - 支持在识别结果里直接切换当前模型
+- 复制单条配置或复制全部配置时，会把模型识别得到的模型列表一起带上
 
 ### ⚡ 性能评测
 
@@ -56,17 +65,34 @@
 
 ## 隐私和数据说明
 
-这个项目默认把配置数据保存在浏览器本地的 `localStorage` 里，不接数据库，也不会帮你托管 Key。
+这个项目默认把配置数据保存在部署机器本地的 `SQLite` 数据库里，不接第三方数据库，也不会帮你托管 Key。
 
 但有一点要说明白: 连通性测试、模型识别、性能评测这类真实联网请求，还是会经过项目自己的同源后端接口转发。这样做主要是为了绕开浏览器直连上游时常见的 CORS 问题。
 
 简单理解就是:
 
-- 配置数据默认存在你自己的浏览器里
-- 项目没有做数据库存储逻辑
+- 配置数据默认存在你部署机器本地的 `SQLite` 文件里
+- 项目没有接外部数据库
 - 真正发请求测试时，Key 会参与当前这次后端转发请求
 
+## 登录说明
+
+- 已内置用户名密码验证码登录
+- 仓库里不再内置任何默认用户名和默认密码
+- 首次部署时必须由你自己设置 `DEFAULT_USERNAME`、`DEFAULT_PASSWORD`、`AUTH_SECRET`
+- 推荐直接使用交互式脚本生成本地未追踪的环境文件
+
 ## 快速开始
+
+先准备运行环境变量：
+
+```bash
+bash scripts/setup-env.sh
+```
+
+这个脚本会让你自己输入登录用户名和密码，并生成本地使用的 `.env.local` 与 Docker 使用的 `.env.docker.local`。
+
+然后再启动：
 
 ```bash
 npm install
@@ -74,6 +100,23 @@ npm run dev
 ```
 
 打开 [http://localhost:3000](http://localhost:3000) 就能开始用。
+
+首次启动后，如果数据库里还没有用户，系统会根据你设置的环境变量创建首个登录用户。
+
+## 环境变量
+
+可以参考 `.env.example`：
+
+```bash
+AUTH_SECRET=
+DATABASE_PATH=./data/ai-key-vault.db
+DEFAULT_USERNAME=
+DEFAULT_PASSWORD=
+```
+
+如果你是手动本地运行，可以直接填写 `DEFAULT_USERNAME` 和 `DEFAULT_PASSWORD`。
+
+如果你走 `bash scripts/setup-env.sh` 或 `bash scripts/docker-compose-up.sh`，脚本会自动生成 `.env.local` 和 `.env.docker.local`，其中用户名和密码会写成 `DEFAULT_USERNAME_B64` / `DEFAULT_PASSWORD_B64`，避免因为特殊字符导致 `.env` 解析出错。
 
 ## 打包部署
 
@@ -83,6 +126,81 @@ npm run start
 ```
 
 部署到支持 Next.js 的平台也没问题，比如 Vercel、Netlify 等。
+
+## Docker Compose 部署
+
+```bash
+bash scripts/docker-compose-up.sh
+```
+
+这个脚本会：
+
+- 检查 `.env.docker.local` 是否存在
+- 如果不存在，则先提示你输入用户名、密码和 `AUTH_SECRET`
+- 再把这些值通过 `--env-file` 传给 `docker compose`
+
+部署后的默认行为：
+
+- 服务监听 `3000`
+- SQLite 数据库挂载到 Docker volume `ai-key-vault-data`
+- 没有仓库内置默认账号密码，必须自行设置
+
+如果你想重新生成一套凭据，可以执行：
+
+```bash
+bash scripts/docker-compose-up.sh --reconfigure
+```
+
+如果你之前已经用旧版本启动过，并且数据库里已经存在历史默认账号，想彻底移除旧账号，需要删除旧的 SQLite 数据文件或 Docker volume 后重新初始化。
+
+## 重置登录账号
+
+登录账号保存在 SQLite 的 `users` 表里，不是每次启动都会被环境变量覆盖。
+
+当前逻辑是：
+
+- 只有当 `users` 表为空时，系统才会用当前环境变量创建首个登录用户
+- 如果你后来改了 `.env.local` 或 `.env.docker.local`，数据库里的旧账号不会自动被替换
+
+所以如果你已经改了账号密码，但仍然登录失败，最简单的方式不是手工找库删数据，而是直接执行重置脚本：
+
+本地运行时：
+
+```bash
+bash scripts/reset-auth.sh --local
+```
+
+Docker Compose 部署时：
+
+```bash
+bash scripts/reset-auth.sh --docker
+```
+
+这个脚本会：
+
+- 清空 `users` 表
+- 按当前 `.env.local` 或 `.env.docker.local` 里的用户名和密码重建登录账号
+- 不会删除你已经保存的配置数据
+
+如果你要连配置一起彻底清空：
+
+本地运行时：
+
+```bash
+rm -f data/ai-key-vault.db
+```
+
+Docker Compose 部署时：
+
+```bash
+docker compose --env-file .env.docker.local down -v
+```
+
+注意：
+
+- `docker-compose.yml` 默认把数据库挂载到 Docker volume `ai-key-vault-data`
+- 所以 Docker 部署下，数据库通常不在宿主机的 `data/ai-key-vault.db`
+- 你直接执行 `sqlite3 data/ai-key-vault.db`，很可能删到的是一个不存在的本地路径
 
 ## 使用方式很简单
 
@@ -100,6 +218,3 @@ npm run start
 - Tailwind CSS 4
 - ECharts
 
-## 友链
-
-- [LinuxDo 社区](https://linux.do/)

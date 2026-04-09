@@ -1,11 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 
+import { getSessionFromRequest } from "@/lib/auth";
 import { runOpenAIProbe } from "@/lib/openai-proxy";
 import type { OpenAIProxyProbeRequest } from "@/lib/openai-proxy-types";
 
 export const runtime = "nodejs";
 
 export async function POST(request: NextRequest) {
+  if (!getSessionFromRequest(request)) {
+    return NextResponse.json({ message: "未登录或会话已过期" }, { status: 401 });
+  }
+
   try {
     const body = (await request.json()) as Partial<OpenAIProxyProbeRequest>;
 
