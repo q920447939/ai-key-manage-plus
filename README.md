@@ -1,3 +1,20 @@
+🚀 **ChatGPT Plus 直充超值来了！**
+
+个人账号直充，批发价**低至9元/月**！  
+Pro月卡仅**260元**！
+
+✅ 非注册机刷机，纯官方账号  
+✅ 网页、Codex、CLI 无任何限制  
+✅ 1分钟快速充值，秒开可用  
+✅ 稳定3个月，封号风险几乎为0  
+
+想省钱又稳？现在下手，一起用AI暴富！💰
+
+共同致富地址 👇  
+https://ccnlmtc8joc0.feishu.cn/wiki/PTlOw3FldibL6RkYcWrc9V4cnxh
+
+#ChatGPT #ChatGPTPlus #AI工具 #低价Plus
+
 # AI Key Vault
 
 一个更适合自己长期用的 AI API Key 管理小工具。
